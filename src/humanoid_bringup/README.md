@@ -552,47 +552,49 @@ per drive.
 
 ```
 # Read-only: show which drive would get which label
-npx ts-node src/humanoid_bringup/assign-names.ts --dry-run
+npx ts-node src/humanoid_bringup/assign-names.ts --ignore_ecat_indices 0,3,18 --dry-run
 
 # Assign every label (asks for "yes" first)
-npx ts-node src/humanoid_bringup/assign-names.ts
+npx ts-node src/humanoid_bringup/assign-names.ts --ignore_ecat_indices 0,3,18
 
 # One file position only (the IgH position from the filename)
 npx ts-node src/humanoid_bringup/assign-names.ts --slave-position 7
 
-# Different switch positions (default 0,3,18)
-npx ts-node src/humanoid_bringup/assign-names.ts --switch-positions 0,3,18
+# Nothing to ignore (every slave on the bus is a drive)
+npx ts-node src/humanoid_bringup/assign-names.ts
 ```
 
 > **Applying this step assumes EtherCAT network is wired exactly same between the robots.**
 > **Assuming monotonic cabling and position 0, 3, 18 as EtherCAT switch positions.**
-> The script prints both as a large warning before the table and again before asking for
+> The script prints both (the second one lists whatever you pass to `--ignore_ecat_indices`) as a large warning before the table and again before asking for
 > confirmation.
 
 Each file in `drive_configs/` is named `position_<NN>_<name>_config.csv`; `NN` is the position
 it was exported from, and the file's own `0x20F2:00` row holds the label.
 
 **The files and Motion Master count differently.** The files are always generated with the IgH
-master, which counts from 0 and includes the Beckhoff EtherCAT switches on the bus — positions
-0, 3 and 18 are switches, so they have no file and the file numbers have gaps. OBLAC's Motion
-Master uses SOEM, which only reports the drives. The script therefore converts the file position
-to a drive number by taking out the switches that come before it:
+master, which counts from 0 and includes every slave on the bus, such as the Beckhoff EtherCAT
+switches. On Roger-3 positions 0, 3 and 18 are switches, so they have no file and the file
+numbers have gaps. OBLAC's Motion Master uses SOEM, which only reports the drives. Pass the IgH
+positions of the slaves that are not drives with `--ignore_ecat_indices` (comma-separated); the
+script converts the file position to a drive number by taking out the ignored positions that
+come before it. With `--ignore_ecat_indices 0,3,18`:
 
 | File | Drive on the network |
 |---|---|
-| `position_01_*` | 1st (switch 0 is before it) |
+| `position_01_*` | 1st (position 0 is before it) |
 | `position_02_*` | 2nd |
-| `position_04_*` | 3rd (switches 0 and 3 are before it) |
-| `position_19_*` | 17th (switches 0, 3 and 18 are before it) |
+| `position_04_*` | 3rd (positions 0 and 3 are before it) |
+| `position_19_*` | 17th (positions 0, 3 and 18 are before it) |
 | `position_33_*` | 31st, the last |
 
 "Nth drive" is the Nth device in bus order, so SOEM's 1-based and IgH's 0-based numbering make
-no difference. The step is only correct when the cabling is monotonic, i.e. the drives are wired
+no difference. Without the flag nothing is ignored and position 0 is the 1st drive. The step is only correct when the cabling is monotonic, i.e. the drives are wired
 in the same order as on the robot the files came from.
 
 - After each write the label is read back, then the drive's parameters are saved
   (`0x1010: Store parameters`), so the label survives a power cycle.
-- A file at a switch position, a file with no drive at its position, two files claiming one
+- A file at an ignored position, a file with no drive at its position, two files claiming one
   position, or two files with the same joint number is reported and skipped.
 - Drives with no file are left untouched.
 - It warns when the number of drives on the network differs from the number of config files
