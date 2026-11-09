@@ -6,6 +6,7 @@ config file and act on it.
 
 | Script | What it does |
 |---|---|
+| `assign-names.ts` | **Step 1.** Writes each drive's joint label (`0x20F2:00`) from the config files, by EtherCAT slave position, in a single command. Run it first on a robot whose drives are not labelled yet. |
 | `write-drive-config.ts` | Diagnoses **system polarity** (`0x200D:00`) against each config file, and can apply polarity, home offset, software position limits and quick stop / SS1 safety configuration in confirmed stages. |
 | `load-drive-configs.ts` | Loads each joint's config file onto its drive, with `--exclude` for objects that must not be overwritten (per-drive calibration values). |
 
@@ -534,11 +535,53 @@ the same network is harmless.
 
 ### 4. Bring up in this order
 
-1. `load-drive-configs.ts --dry-run` — check the pairing table before writing anything.
-2. `load-drive-configs.ts --exclude ...` — load the configs, excluding per-drive calibration
+1. `assign-names.ts --dry-run`, then `assign-names.ts` — label every drive by slave position
+   (see [assign-names.ts](#assign-namests)). Skip this if the drives already carry their labels.
+2. `load-drive-configs.ts --dry-run` — check the pairing table before writing anything.
+3. `load-drive-configs.ts --exclude ...` — load the configs, excluding per-drive calibration
    values (see below).
-3. `write-drive-config.ts --diagnose` — read-only polarity check.
-4. `write-drive-config.ts --apply` — staged, each stage confirmed.
+4. `write-drive-config.ts --diagnose` — read-only polarity check.
+5. `write-drive-config.ts --apply` — staged, each stage confirmed.
+
+---
+
+## assign-names.ts
+
+Labels every drive in one command, so a new robot can be named without one `0x20F2:00` write
+per drive.
+
+```
+# Read-only: show which drive would get which label
+npx ts-node src/humanoid_bringup/assign-names.ts --dry-run
+
+# Assign every label (asks for "yes" first)
+npx ts-node src/humanoid_bringup/assign-names.ts
+
+# One slave position only
+npx ts-node src/humanoid_bringup/assign-names.ts --slave-position 7
+```
+
+> **Applying this step assumes EtherCAT network is wired exactly same between the robots.**
+> The script prints this as a large warning before the table and again before asking for
+> confirmation.
+
+Each file in `drive_configs/` is named `position_<NN>_<name>_config.csv`; `NN` is the slave
+position it was exported from, and the file's own `0x20F2:00` row holds the label. The script
+writes that label to the drive at the same position on the connected robot: `position_01_*` to
+the 1st slave, `position_02_*` to the 2nd, and so on.
+
+- **"Nth slave" is the Nth device in bus order**, not the raw position number, because Motion
+  Master counts from 1 with SOEM and from 0 with IgH. Slaves that are not drives still count,
+  which is why the file numbers have gaps.
+- After each write the label is read back, then the drive's parameters are saved
+  (`0x1010: Store parameters`), so the label survives a power cycle.
+- Slaves with no file are left untouched. A file with no slave at its position, two files
+  claiming one position, or two files with the same joint number is reported and skipped.
+- It warns when the number of slaves on the network differs from the highest position in the
+  files, which is the usual sign the wiring is not the same.
+
+Check the table against the physical robot before typing `yes`: a drive at the wrong position
+gets the wrong name, and every later step trusts that name.
 
 ---
 
