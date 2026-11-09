@@ -1,19 +1,28 @@
 # humanoid_bringup — drive bring-up template
 
 A starting point for bringing up the drives of a multi-joint humanoid: drop your exported
-joint configs into `drive_configs/`, and the two scripts here pair each live drive with its
-config file and act on it.
+joint configs into `drive_configs/`, and the scripts here label each live drive, pair it with
+its config file and act on it.
 
 | Script | What it does |
 |---|---|
-| `assign-names.ts` | **Step 1.** Writes each drive's joint label (`0x20F2:00`) from the config files, by position in the EtherCAT chain, in a single command. Run it first on a robot whose drives are not labelled yet. |
+| `assign-names.ts` | **Step 1 of the bring-up.** Writes each drive's joint label (`0x20F2:00`) from the config files, by position in the EtherCAT chain, in a single command. Run it first on a robot whose drives are not labelled yet. |
 | `write-drive-config.ts` | Diagnoses **system polarity** (`0x200D:00`) against each config file, and can apply polarity, home offset, software position limits and quick stop / SS1 safety configuration in confirmed stages. |
 | `load-drive-configs.ts` | Loads each joint's config file onto its drive, with `--exclude` for objects that must not be overwritten (per-drive calibration values). |
 
 **This directory ships with `drive_configs/` empty.** Nothing runs until you put config files
 in it — see [Using this as a template](#using-this-as-a-template) below.
 
-Most of this document describes `write-drive-config.ts`, the larger of the two.
+The scripts are meant to be run in this order — the full sequence is in
+[Bring up in this order](#4-bring-up-in-this-order):
+
+1. `assign-names.ts` — give every drive its joint label, by position in the EtherCAT chain.
+   Skip it if the drives are already labelled.
+2. `load-drive-configs.ts` — load each joint's config file onto its drive.
+3. `write-drive-config.ts` — check and apply polarity, home offset, limits and safety.
+
+Most of this document describes `write-drive-config.ts`, the largest of the three. The new
+first step is described in [assign-names.ts](#assign-namests).
 
 Diagnoses whether the **system polarity** (`0x200D:00`) of the live devices on the currently
 connected Motion Master session matches the values in their corresponding config files under
@@ -507,7 +516,9 @@ the filename when a file has no label row yet.
 
 ### 2. Label every drive and every config file
 
-Matching is done on the `0x20F2:00` label, in the form `"<number> <joint name>"`:
+Matching is done on the `0x20F2:00` label, in the form `"<number> <joint name>"`. Run
+[`assign-names.ts`](#assign-namests) (step 1) to write the labels to a robot's drives in one
+command, taken from the config files:
 
 ```
 0x20f2,  0,  104 head_yaw
