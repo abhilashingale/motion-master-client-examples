@@ -36,7 +36,8 @@
  * label. Without --device-number every labelled drive is processed.
  *
  * Usage:
- *   # Read-only: show the offset each drive would get
+ *   # Read-only: table of adjusted position now, calculated ST offset and expected adjusted position.
+ *   # Nothing is written and --home is ignored.
  *   npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts --dry-run
  *
  *   # Set and save the offsets (asks for "yes" first)
@@ -373,7 +374,7 @@ async function main(): Promise<void> {
   banner([
     "Every joint must be at its HOME position before this step",
     `Sets 0x2112:06 so 0x2113:02 reads ${HALF} (middle of 2^${resolutionBits}) and SAVES it on the drive`,
-    ...(home ? ["--home: the drives will be ENERGIZED for Homing (method 37) - keep the E-stop/STO within reach"] : []),
+    ...(home && !dryRun ? ["--home: the drives will be ENERGIZED for Homing (method 37) - keep the E-stop/STO within reach"] : []),
   ]);
 
   let live = await scanLiveDevices();
@@ -386,13 +387,15 @@ async function main(): Promise<void> {
   const plans: Plan[] = [];
   for (const d of live) plans.push(await plan(d));
 
+  const show = (n: number) => (Number.isNaN(n) ? "-" : n);
   console.table(
     plans.map((p) => ({
       Joint: p.device.label,
-      "Raw (0x2113:01)": Number.isNaN(p.raw) ? "-" : p.raw,
-      "Adjusted (0x2113:02)": Number.isNaN(p.adjustedBefore) ? "-" : p.adjustedBefore,
-      "Current offset": Number.isNaN(p.currentOffset) ? "-" : p.currentOffset,
-      "New offset": Number.isNaN(p.newOffset) ? "-" : p.newOffset,
+      "Adjusted before (0x2113:02)": show(p.adjustedBefore),
+      "Raw (0x2113:01)": show(p.raw),
+      "ST offset now (0x2112:06)": show(p.currentOffset),
+      "Calculated ST offset": show(p.newOffset),
+      "Expected adjusted after": Number.isNaN(p.newOffset) ? "-" : wrap(p.raw - p.newOffset),
       Status: p.skip ?? (dryRun ? "WOULD SET" : "READY"),
     })),
   );
@@ -411,7 +414,7 @@ async function main(): Promise<void> {
 
   const ready = plans.filter((p) => !p.skip);
   if (dryRun) {
-    console.log("\nDry run — nothing written.\n");
+    console.log(`\nDry run — nothing written${home ? ", and --home is ignored (no homing in a dry run)" : ""}.\n`);
     return;
   }
   if (ready.length === 0) {

@@ -630,7 +630,8 @@ turn offset (`0x2112:06`) so that Encoder 2 feedback Adjusted position (`0x2113:
 **Move every joint to its home position first** — the script cannot do that.
 
 ```
-# Read-only: show the offset each drive would get
+# Read-only: table of the adjusted position now, the calculated ST offset and the expected
+# adjusted position (2^19). Nothing is written and there is no homing.
 npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts --dry-run
 
 # Set and save (asks for "yes" first); one joint with --device-number 104
