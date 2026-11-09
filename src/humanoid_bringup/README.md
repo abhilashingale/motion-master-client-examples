@@ -7,6 +7,7 @@ its config file and act on it.
 | Script | What it does |
 |---|---|
 | `assign-names.ts` | **Step 1 of the bring-up.** Writes each drive's joint label (`0x20F2:00`) from the config files, by position in the EtherCAT chain, in a single command. Run it first on a robot whose drives are not labelled yet. |
+| `set-encoder-st-offset.ts` | Centres the Encoder 2 single-turn range on the home position: sets the single turn offset (`0x2112:06`) so the adjusted position (`0x2113:02`) reads 2^19, saves it, verifies, and can then home at the current position (method 37). |
 | `write-drive-config.ts` | Diagnoses **system polarity** (`0x200D:00`) against each config file, and can apply polarity, home offset, software position limits and quick stop / SS1 safety configuration in confirmed stages. |
 | `load-drive-configs.ts` | Loads each joint's config file onto its drive, with `--exclude` for objects that must not be overwritten (per-drive calibration values). |
 
@@ -551,8 +552,11 @@ the same network is harmless.
 2. `load-drive-configs.ts --dry-run` — check the pairing table before writing anything.
 3. `load-drive-configs.ts --exclude ...` — load the configs, excluding per-drive calibration
    values (see below).
-4. `write-drive-config.ts --diagnose` — read-only polarity check.
-5. `write-drive-config.ts --apply` — staged, each stage confirmed.
+4. `set-encoder-st-offset.ts --dry-run`, then `set-encoder-st-offset.ts [--home]` — with every
+   joint at its home position, centre the Encoder 2 single-turn range (see
+   [set-encoder-st-offset.ts](#set-encoder-st-offsetts)).
+5. `write-drive-config.ts --diagnose` — read-only polarity check.
+6. `write-drive-config.ts --apply` — staged, each stage confirmed.
 
 ---
 
@@ -613,6 +617,58 @@ in the same order as on the robot the files came from.
 
 Check the table against the physical robot before typing `yes`: a drive in the wrong place gets
 the wrong name, and every later step trusts that name.
+
+---
+
+## set-encoder-st-offset.ts
+
+Moves the Encoder 2 actual position to the middle of its single-turn range, so the joint gets
+the maximum range of motion without the single-turn value overflowing. It sets Encoder 2 single
+turn offset (`0x2112:06`) so that Encoder 2 feedback Adjusted position (`0x2113:02`) is exactly
+2^19, the middle of a 2^20 range.
+
+**Move every joint to its home position first** — the script cannot do that.
+
+```
+# Read-only: show the offset each drive would get
+npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts --dry-run
+
+# Set and save (asks for "yes" first); one joint with --device-number 104
+npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts
+
+# Also home at the current position afterwards (separate confirmation)
+npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts --home
+```
+
+Per drive:
+
+1. Reads `--samples` (5-10, default 10) samples of the raw (`0x2113:01`) and adjusted
+   (`0x2113:02`) position. A drive whose raw value varies by more than `--max-spread` counts
+   (default 16) is skipped as moving, and so is one that is operation enabled.
+2. Calculates the offset from the raw position:
+
+   ```
+   IF raw < resolution / 2    offset = raw + 2^19
+   ELSE                       offset = raw - 2^19
+   ```
+
+3. Writes `0x2112:06` and sets *Restore home position when loading configuration*
+   (`0x2005:02`) to 1 (YES), saves all parameters (`0x1010`), then reads `0x2113:02` back. The
+   drive counts as a success only when it reads 2^19 within `--tolerance` counts (default 4). On
+   anything else the previous offset and restore flag are written back and saved.
+4. With `--home`, for the successful drives only and after a second confirmation: Homing at the
+   current position (method 37), then re-checks that the actual position (`0x6064:00`) is within
+   `--home-tolerance-deg` (default 0.5°) of 0.
+
+> **Steps 1-3 only read and write parameters. Step 4 (`--home`) energizes the drives** (Operation
+> enabled, Homing mode). Method 37 only defines the current position as home and is not meant to
+> move the shaft, but run it yourself at the robot with the approved E-stop/STO within reach. Each
+> drive is returned to Switched on disabled and its previous mode of operation is restored.
+
+The calculation assumes the adjusted position is the raw position minus the offset. The script
+warns when a drive does not behave that way, and the read-back after writing catches it. A
+non-zero home offset (`0x607C:00`) shifts the position reported after homing; it is printed.
+`--resolution-bits` (default 20) sets the single-turn resolution if your encoder differs.
 
 ---
 
