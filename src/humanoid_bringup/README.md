@@ -6,7 +6,7 @@ config file and act on it.
 
 | Script | What it does |
 |---|---|
-| `assign-names.ts` | **Step 1.** Writes each drive's joint label (`0x20F2:00`) from the config files, by EtherCAT slave position, in a single command. Run it first on a robot whose drives are not labelled yet. |
+| `assign-names.ts` | **Step 1.** Writes each drive's joint label (`0x20F2:00`) from the config files, by position in the EtherCAT chain, in a single command. Run it first on a robot whose drives are not labelled yet. |
 | `write-drive-config.ts` | Diagnoses **system polarity** (`0x200D:00`) against each config file, and can apply polarity, home offset, software position limits and quick stop / SS1 safety configuration in confirmed stages. |
 | `load-drive-configs.ts` | Loads each joint's config file onto its drive, with `--exclude` for objects that must not be overwritten (per-drive calibration values). |
 
@@ -557,31 +557,49 @@ npx ts-node src/humanoid_bringup/assign-names.ts --dry-run
 # Assign every label (asks for "yes" first)
 npx ts-node src/humanoid_bringup/assign-names.ts
 
-# One slave position only
+# One file position only (the IgH position from the filename)
 npx ts-node src/humanoid_bringup/assign-names.ts --slave-position 7
+
+# Different switch positions (default 0,3,18)
+npx ts-node src/humanoid_bringup/assign-names.ts --switch-positions 0,3,18
 ```
 
 > **Applying this step assumes EtherCAT network is wired exactly same between the robots.**
-> The script prints this as a large warning before the table and again before asking for
+> **Assuming monotonic cabling and position 0, 3, 18 as EtherCAT switch positions.**
+> The script prints both as a large warning before the table and again before asking for
 > confirmation.
 
-Each file in `drive_configs/` is named `position_<NN>_<name>_config.csv`; `NN` is the slave
-position it was exported from, and the file's own `0x20F2:00` row holds the label. The script
-writes that label to the drive at the same position on the connected robot: `position_01_*` to
-the 1st slave, `position_02_*` to the 2nd, and so on.
+Each file in `drive_configs/` is named `position_<NN>_<name>_config.csv`; `NN` is the position
+it was exported from, and the file's own `0x20F2:00` row holds the label.
 
-- **"Nth slave" is the Nth device in bus order**, not the raw position number, because Motion
-  Master counts from 1 with SOEM and from 0 with IgH. Slaves that are not drives still count,
-  which is why the file numbers have gaps.
+**The files and Motion Master count differently.** The files are always generated with the IgH
+master, which counts from 0 and includes the Beckhoff EtherCAT switches on the bus — positions
+0, 3 and 18 are switches, so they have no file and the file numbers have gaps. OBLAC's Motion
+Master uses SOEM, which only reports the drives. The script therefore converts the file position
+to a drive number by taking out the switches that come before it:
+
+| File | Drive on the network |
+|---|---|
+| `position_01_*` | 1st (switch 0 is before it) |
+| `position_02_*` | 2nd |
+| `position_04_*` | 3rd (switches 0 and 3 are before it) |
+| `position_19_*` | 17th (switches 0, 3 and 18 are before it) |
+| `position_33_*` | 31st, the last |
+
+"Nth drive" is the Nth device in bus order, so SOEM's 1-based and IgH's 0-based numbering make
+no difference. The step is only correct when the cabling is monotonic, i.e. the drives are wired
+in the same order as on the robot the files came from.
+
 - After each write the label is read back, then the drive's parameters are saved
   (`0x1010: Store parameters`), so the label survives a power cycle.
-- Slaves with no file are left untouched. A file with no slave at its position, two files
-  claiming one position, or two files with the same joint number is reported and skipped.
-- It warns when the number of slaves on the network differs from the highest position in the
-  files, which is the usual sign the wiring is not the same.
+- A file at a switch position, a file with no drive at its position, two files claiming one
+  position, or two files with the same joint number is reported and skipped.
+- Drives with no file are left untouched.
+- It warns when the number of drives on the network differs from the number of config files
+  (31 for Roger-3), which is the usual sign it is not the same robot.
 
-Check the table against the physical robot before typing `yes`: a drive at the wrong position
-gets the wrong name, and every later step trusts that name.
+Check the table against the physical robot before typing `yes`: a drive in the wrong place gets
+the wrong name, and every later step trusts that name.
 
 ---
 

@@ -8,18 +8,25 @@
  *
  * Each file in `drive_configs/` is named after the slave position it was exported from
  * (`position_01_head-yaw_config.csv` -> slave position 1) and carries its joint label in its own
- * 0x20F2:00 row. This script copies that label to whichever drive sits at the same position on
- * the connected robot:
+ * 0x20F2:00 row. This script copies that label to the drive in the same place on the connected
+ * robot.
  *
- *   position_01_*.csv  ->  the 1st slave on the network
- *   position_02_*.csv  ->  the 2nd slave on the network
+ * The files are always generated with the IgH master, which counts from 0 and counts the
+ * Beckhoff EtherCAT switches on the bus: positions 0, 3 and 18 are switches, so they have no
+ * file and the numbers in `drive_configs/` have gaps. The Motion Master here runs SOEM, which
+ * only reports the drives. The file position is therefore converted to a drive index by taking
+ * out the switches that come before it:
+ *
+ *   position_01_*.csv  ->  1st drive  (switch 0 is before it)
+ *   position_02_*.csv  ->  2nd drive
+ *   position_04_*.csv  ->  3rd drive  (switches 0 and 3 are before it)
+ *   position_19_*.csv  ->  17th drive (switches 0, 3 and 18 are before it)
  *   ...
  *
- * "Nth slave" means the Nth device in bus order. Motion Master numbers positions from 1 with
- * SOEM and from 0 with the IgH master, so the position is not used as is: every device on the
- * network is sorted by position and the file number is the 1-based rank in that list. Slaves
- * that are not drives (and so have no file) still count, which is why the numbers in
- * `drive_configs/` have gaps.
+ * "Nth drive" means the Nth device in bus order (devices are sorted by position, so SOEM's
+ * 1-based and IgH's 0-based numbering make no difference). The switch positions can be changed
+ * with --switch-positions. The step only makes sense when the cabling is monotonic, i.e. the
+ * drives are wired in the same order as on the robot the files came from.
  *
  * After each write the label is read back; once it matches, parameters are saved on that drive
  * (0x1010: Store parameters) so the label survives a power cycle. Nothing is written without
@@ -32,8 +39,11 @@
  *   # Assign every label (asks for confirmation first)
  *   npx ts-node src/humanoid_bringup/assign-names.ts
  *
- *   # One slave position only
+ *   # One file position only (the IgH position from the filename)
  *   npx ts-node src/humanoid_bringup/assign-names.ts --slave-position 7
+ *
+ *   # Different switch positions
+ *   npx ts-node src/humanoid_bringup/assign-names.ts --switch-positions 0,3,18
  *
  * Next step: `load-drive-configs.ts --dry-run`, then `write-drive-config.ts --diagnose`.
  */
@@ -52,25 +62,45 @@ const DEVICE_LABEL_INDEX = 0x20f2;
 const DEVICE_LABEL_SUBINDEX = 0;
 const DEFAULT_CONFIG_DIR = join(__dirname, "drive_configs");
 
-const WARNING =
-  "Applying this step assumes EtherCAT network is wired exactly same between the robots";
+const DEFAULT_SWITCH_POSITIONS = [0, 3, 18];
+
+function parseSwitchPositions(raw: string): number[] {
+  return raw
+    .split(",")
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0)
+    .map((t) => {
+      const n = parseInt(t, 10);
+      if (!Number.isInteger(n) || n < 0) throw new Error(`Invalid --switch-positions entry "${t}".`);
+      return n;
+    });
+}
 
 program
   .addOption(new Option("--config-dir <path>", "directory holding the joint config files").default(DEFAULT_CONFIG_DIR))
-  .addOption(new Option("--slave-position <n>", "only assign the label for this 1-based slave position").argParser((v) => {
+  .addOption(new Option("--slave-position <n>", "only assign the label for this file position (IgH, from the filename)").argParser((v) => {
     const n = parseInt(v, 10);
-    if (!Number.isInteger(n) || n < 1) throw new Error(`Invalid --slave-position "${v}". Expected a positive integer.`);
+    if (!Number.isInteger(n) || n < 0) throw new Error(`Invalid --slave-position "${v}". Expected a non-negative integer.`);
     return n;
   }))
+  .addOption(
+    new Option(
+      "--switch-positions <list>",
+      "comma-separated IgH positions of the EtherCAT switches, which have no drive and no config file",
+    )
+      .default(DEFAULT_SWITCH_POSITIONS, DEFAULT_SWITCH_POSITIONS.join(","))
+      .argParser(parseSwitchPositions),
+  )
   .addOption(new Option("--dry-run", "show the pairing table without writing anything").default(false));
 
 program.allowExcessArguments(false);
 program.showHelpAfterError("(run with --help to see the available options)");
 program.parse();
 
-const { configDir, slavePosition, dryRun, requestTimeout = 10000 } = program.opts<{
+const { configDir, slavePosition, switchPositions, dryRun, requestTimeout = 10000 } = program.opts<{
   configDir: string;
   slavePosition?: number;
+  switchPositions: number[];
   dryRun: boolean;
   requestTimeout?: number;
 }>();
@@ -87,10 +117,20 @@ function confirm(promptText: string): Promise<boolean> {
 }
 
 function printWarning(): void {
-  const width = WARNING.length + 8;
-  const bar = "!".repeat(width);
-  const line = `!!  ${WARNING}  !!`;
-  console.warn(`\n${bar}\n${bar}\n${"!!" + " ".repeat(width - 4) + "!!"}\n${line}\n${"!!" + " ".repeat(width - 4) + "!!"}\n${bar}\n${bar}\n`);
+  const lines = [
+    "Applying this step assumes EtherCAT network is wired exactly same between the robots",
+    `Assuming monotonic cabling and position ${switchPositions.join(", ")} as EtherCAT switch positions`,
+  ];
+  const inner = Math.max(...lines.map((l) => l.length)) + 4;
+  const bar = "!".repeat(inner + 4);
+  const blank = `!!${" ".repeat(inner)}!!`;
+  const body = lines.map((l) => `!!  ${l.padEnd(inner - 2)}!!`);
+  console.warn(`\n${[bar, bar, blank, ...body, blank, bar, bar].join("\n")}\n`);
+}
+
+/** The IgH position of a file -> the 0-based index of its drive in bus order, with the switches taken out. */
+function driveIndexOf(igHPosition: number): number {
+  return igHPosition - switchPositions.filter((s) => s < igHPosition).length;
 }
 
 interface NameSource {
@@ -135,7 +175,10 @@ function scanNameSources(dir: string): { sources: Map<number, NameSource>; probl
 }
 
 interface Row {
+  /** The IgH position from the filename. */
   slavePosition: number;
+  /** 1-based index of the drive in bus order, with the switches taken out. */
+  driveNumber?: number;
   deviceRef?: string | number;
   deviceAddress?: number;
   currentLabel: string;
@@ -159,13 +202,12 @@ async function main(): Promise<void> {
 
   const devices = await lastValueFrom(client.request.getDevices(requestTimeout));
   const byBusOrder = [...devices].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
-  console.log(`Discovered ${byBusOrder.length} slave(s) on the network.\n`);
+  console.log(`Discovered ${byBusOrder.length} drive(s) on the network.\n`);
 
-  const highest = Math.max(...sources.keys());
-  if (byBusOrder.length !== highest) {
+  if (byBusOrder.length !== sources.size) {
     console.warn(
-      `[WARN] The network has ${byBusOrder.length} slave(s) but the config files go up to slave position ${highest}. ` +
-        `The wiring is probably not the same as the robot the files came from.\n`,
+      `[WARN] The network has ${byBusOrder.length} drive(s) but there are ${sources.size} config file(s). ` +
+        `The robot is probably not the one the files came from.\n`,
     );
   }
 
@@ -173,14 +215,27 @@ async function main(): Promise<void> {
   for (const source of [...sources.values()].sort((a, b) => a.slavePosition - b.slavePosition)) {
     if (slavePosition !== undefined && source.slavePosition !== slavePosition) continue;
 
-    const device = byBusOrder[source.slavePosition - 1];
-    if (!device) {
+    if (switchPositions.includes(source.slavePosition)) {
       rows.push({
         slavePosition: source.slavePosition,
         currentLabel: "-",
         newLabel: source.label,
         fileName: source.fileName,
-        skip: "NO SLAVE AT THIS POSITION",
+        skip: "FILE AT A SWITCH POSITION",
+      });
+      continue;
+    }
+
+    const driveIndex = driveIndexOf(source.slavePosition);
+    const device = byBusOrder[driveIndex];
+    if (!device) {
+      rows.push({
+        slavePosition: source.slavePosition,
+        driveNumber: driveIndex + 1,
+        currentLabel: "-",
+        newLabel: source.label,
+        fileName: source.fileName,
+        skip: "NO DRIVE AT THIS POSITION",
       });
       continue;
     }
@@ -196,6 +251,7 @@ async function main(): Promise<void> {
     }
     rows.push({
       slavePosition: source.slavePosition,
+      driveNumber: driveIndex + 1,
       deviceRef,
       deviceAddress: device.deviceAddress,
       currentLabel,
@@ -215,7 +271,7 @@ async function main(): Promise<void> {
     const key = numberOf(row.newLabel);
     const other = seen.get(key);
     if (other) {
-      row.skip = row.skip ?? `DUPLICATE JOINT NUMBER (also slave position ${other.slavePosition})`;
+      row.skip = row.skip ?? `DUPLICATE JOINT NUMBER (also file position ${other.slavePosition})`;
     } else {
       seen.set(key, row);
     }
@@ -223,7 +279,8 @@ async function main(): Promise<void> {
 
   console.table(
     rows.map((r) => ({
-      "Slave position": r.slavePosition,
+      "File position (IgH)": r.slavePosition,
+      "Drive # (SOEM)": r.driveNumber ?? "-",
       "Device address": r.deviceAddress !== undefined ? `0x${r.deviceAddress.toString(16).toUpperCase()}` : "-",
       "Current label": r.currentLabel,
       "New label": r.newLabel,
@@ -232,12 +289,10 @@ async function main(): Promise<void> {
     })),
   );
 
-  const slaves = byBusOrder
-    .map((d, i) => ({ d, position: i + 1 }))
-    .filter(({ position }) => !sources.has(position))
-    .map(({ position }) => position);
-  if (slavePosition === undefined && slaves.length > 0) {
-    console.log(`Slave position(s) with no config file, left untouched: ${slaves.join(", ")}\n`);
+  const mapped = new Set(rows.map((r) => r.driveNumber).filter((n): n is number => n !== undefined));
+  const untouched = byBusOrder.map((_, i) => i + 1).filter((n) => !mapped.has(n));
+  if (slavePosition === undefined && untouched.length > 0) {
+    console.log(`Drive(s) with no config file, left untouched: ${untouched.join(", ")}\n`);
   }
 
   if (dryRun) {
@@ -262,10 +317,10 @@ async function main(): Promise<void> {
     return;
   }
 
-  const results: { "Slave position": number; "New label": string; Status: string }[] = [];
+  const results: { "File position (IgH)": number; "New label": string; Status: string }[] = [];
   for (const row of toWrite) {
     const result = (Status: string) =>
-      results.push({ "Slave position": row.slavePosition, "New label": row.newLabel, Status });
+      results.push({ "File position (IgH)": row.slavePosition, "New label": row.newLabel, Status });
     try {
       await client.request.download(
         row.deviceRef!,
