@@ -140,3 +140,10 @@ test-motion-master-macOS/
 # macOS Finder metadata
 .DS_Store
 **/.DS_Store
+
+# Robot-specific bring-up directories, kept out of the shared repository: they
+# carry one customer's joint configs and commissioned safety values. The
+# reusable version is src/humanoid_bringup/, which ships with an empty
+# drive_configs/.
+src/Vesoma_SS1/
+src/PT1_minerva_bringup/

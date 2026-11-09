@@ -1,0 +1,8 @@
+Drop one exported config.csv per joint into this directory.
+
+Naming: <number>_<joint_name>.config.csv, e.g. 104_head_yaw.config.csv.
+The number is what the scripts match on; see ../README.md.
+
+This file only exists so the empty directory survives in git. Delete it once
+you have added your own configs, or leave it — the scripts ignore anything that
+does not end in .csv.
