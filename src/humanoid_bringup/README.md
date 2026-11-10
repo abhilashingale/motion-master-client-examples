@@ -1,16 +1,13 @@
 # humanoid_bringup — drive bring-up template
 
 A starting point for bringing up the drives of a multi-joint humanoid: drop your exported
-joint configs into `drive_configs/`, and the scripts here label each live drive, pair it with
-its config file and act on it.
+joint configs into `drive_configs/`, and the scripts here pair each live drive with its config
+file and act on it.
 
 | Script | What it does |
 |---|---|
-| `assign-names.ts` | **Step 1 of the bring-up.** Writes each drive's joint label (`0x20F2:00`) from the config files, by position in the EtherCAT chain, in a single command. Run it first on a robot whose drives are not labelled yet. |
-| `set-encoder-st-offset.ts` | Centres the Encoder 2 single-turn range on the home position: sets the single turn offset (`0x2112:06`) so the adjusted position (`0x2113:02`) reads 2^19, saves it and verifies. |
-| `home-joints.ts` | Homes every joint at its current position (method 37), one after the other, printing each joint's assigned name first. |
-| `write-drive-config.ts` | Diagnoses **system polarity** (`0x200D:00`) against each config file, and can apply polarity, home offset, software position limits and quick stop / SS1 safety configuration in confirmed stages. |
 | `load-drive-configs.ts` | Loads each joint's config file onto its drive, with `--exclude` for objects that must not be overwritten (per-drive calibration values). |
+| `write-drive-config.ts` | The commissioning script, in confirmed stages: diagnoses **system polarity** (`0x200D:00`) against each config file, can assign the joint names by slave position (Stage 1), applies the polarity (Stage 2), centres the Encoder 2 single-turn range and homes every joint there (Stage 3), saves (Stage 4), and applies software position limits (Stage 5) and quick stop / SS1 safety configuration (Stage 7). |
 
 **This directory ships with `drive_configs/` empty.** Nothing runs until you put config files
 in it — see [Using this as a template](#using-this-as-a-template) below.
@@ -18,15 +15,11 @@ in it — see [Using this as a template](#using-this-as-a-template) below.
 The scripts are meant to be run in this order — the full sequence is in
 [Bring up in this order](#4-bring-up-in-this-order):
 
-1. `assign-names.ts` — give every drive its joint label, by position in the EtherCAT chain.
-   Skip it if the drives are already labelled.
-2. `load-drive-configs.ts` — load each joint's config file onto its drive.
-3. `set-encoder-st-offset.ts` — centre the Encoder 2 single-turn range on the home position.
-4. `home-joints.ts` — home each joint at its current position (method 37), one by one.
-5. `write-drive-config.ts` — check and apply polarity, home offset, limits and safety.
+1. `load-drive-configs.ts` — load each joint's config file onto its drive.
+2. `write-drive-config.ts --apply` — name the drives, apply polarity, centre the encoders, home,
+   save, and apply limits and safety, stage by stage.
 
-Most of this document describes `write-drive-config.ts`, the largest of the five. The other
-scripts are described in their own sections further down.
+Most of this document describes `write-drive-config.ts`.
 
 Diagnoses whether the **system polarity** (`0x200D:00`) of the live devices on the currently
 connected Motion Master session matches the values in their corresponding config files under
@@ -44,12 +37,15 @@ The console output is split into numbered stages so the process is easy to follo
 | Stage | Runs with | What it does |
 |-------|-----------|---------------|
 | **0** | `--diagnose`, `--apply` | Diagnose the current polarity and compare it against the config files by joint name. Read-only. |
-| **1** | `--apply` only | Ask for confirmation before applying any polarity change. |
-| **2** | `--apply` only | Check STO (Safe Torque Off) is inactive on every device — abort with a warning if not. Then write the polarity change (`MISMATCH` devices only) and cycle the controlword `0 -> 6 -> 7` on every `MATCH`/`MISMATCH` device. Not saved by itself — see the note below. |
-| **3** | `--apply` only | **Only** for devices whose polarity did *not* match their config file (`MISMATCH`) that completed Stage 2 — `MATCH` devices are left alone entirely. Inverting polarity at a non-zero angle adds a full revolution to the Actual position value, in either direction — always fixed by `+360°`. To make that fix exact, **checks and writes the home offset (`0x607C:00`) to `0`** if it isn't already (the only write this stage makes), reads the Actual position value (`0x6064:00`, for the table only), and *calculates* the pending home offset as `+360°` worth of counts for every such device. |
-| **4** | `--apply` only | Asks for confirmation again, then — only if restore home position (`0x2005:02`) reads `1` on every device from Stage 2 — writes the home offset adjustments Stage 3 calculated and, once verified, **saves all parameters** on that device (`0x1010`: Store parameters) — see the note below. Finally reads and prints the Actual position value (`0x6064:00`), in degrees, for **every** device that went through Stage 2 (`MATCH` and `MISMATCH` alike), regardless of the above. |
+| **1** | `--apply --assign-names` | Write each drive's joint label (`0x20F2:00`) from the `position_<NN>_*.csv` files, by position in the EtherCAT chain, so a robot whose drives were never labelled is named in the same run. `--ignore_ecat_indices` lists the IgH positions that are not drives. Prints a large wiring warning. Stage 0 is then repeated with the new names. Skipped without `--assign-names`. |
+| **2** | `--apply` only | Ask for confirmation, then check STO (Safe Torque Off) is inactive on every device — abort with a warning if not. Then write the **system polarity from the config file** (`MISMATCH` devices only) and cycle the controlword `0 -> 6 -> 7` on every `MATCH`/`MISMATCH` device. The polarity is saved in Stage 3. |
+| **3** | `--apply` only | Per joint, one after the other, with its assigned name printed first: set **Encoder 2 single turn offset (`0x2112:06`)** so the Encoder 2 adjusted position (`0x2113:02`) is exactly 2^19, the middle of its single-turn range; set Restore home position (`0x2005:02`) = 1; save; read `0x2113:02` back; then **home at the current position with method 37**. No home offset correction is made — the Home Offset (`0x607C:00`) must be `0` at the end of the homing, otherwise the run **fails loudly**. |
+| **4** | `--apply` only | Ask for confirmation, then **save all parameters** on every homed device (`0x1010`: Store parameters) so the homed position persists, and print each device's Actual position (`0x6064:00`) and Home Offset (`0x607C:00`). A non-zero Home Offset fails loudly. |
 | **5** | `--apply` only | Asks for confirmation, then writes the software position limits (`0x607D:01` min, `0x607D:02` max) from each device's matched config file to that device, for every Stage 2 device whose config file has both values, and — once verified — **saves all parameters** on that device. Prints a summary in degrees. |
 | **7** | `--apply` only | *(there is no Stage 6)* "Quick and SS1 Configuration" — the same parameters `Damping Configuration/configure-damping-parameters.promise.ts` writes. Quick stop option code (`0x605A:00`) and ASC duration (`0x2010:12`) are written via plain SDO and saved; three SMM safety parameters (`0x2641:01`, `0x2650:01`, `0x6651:01`) are written via the authenticated SMM configuration flow using `--username`/`--password`. Only devices whose values differ from target are touched. Asks for confirmation first. |
+
+A failure in Stages 1-4 throws and stops the run, so Stages 5 and 7 never run on a
+half-commissioned robot.
 
 Stage 2's controlword transition (`0x6040:00`: clear -> Shutdown -> Switch On) makes a
 `MISMATCH` device's newly written polarity take effect; `MATCH` devices have nothing written,
@@ -63,38 +59,16 @@ but the same transition is still applied.
 > affected device(s), before anything is written. Release STO on those devices and re-run
 > `--apply`.
 
-> **On persistence:** Stage 2's polarity write and Stage 3/4's home offset writes are plain SDO
-> downloads — none is saved by itself. A device's parameters become persistent if *either*:
-> (a) Stage 4 reaches its save step for that device, which requires the device to have gone
-> through Stage 3's polarity-inversion correction, restore home position (`0x2005:02`) reading
-> `1` on every device from Stage 2, and your confirmation at Stage 4's prompt; or (b) Stage 5 saves it,
-> which requires its config file to have both software position limits and your confirmation at
-> Stage 5's prompt. Either save persists that device's *entire* current parameter set at that
-> moment, including its Stage 2 polarity write — not just the object that stage was about. A
-> device that never reaches either save step keeps every write from this script live-only, and
-> loses it on the next power cycle or config reload. Stage 7 is independent of this: it saves
-> its own quick-stop objects directly (`0x1010`) and persists its own SMM safety objects via the
-> SMM validation flow, regardless of what Stages 4/5 did.
+> **On persistence:** Stage 2's polarity write is a plain SDO download, saved by Stage 3's save
+> (`0x1010`) together with the Encoder 2 single turn offset and Restore home position. Stage 4
+> saves again after the homing, so the homed position persists. Stage 5 saves the software
+> position limits and Stage 7 saves its own quick-stop objects (`0x1010`) and persists its SMM
+> safety objects via the SMM validation flow.
 
----
-
-## Background
-
-`drive_configs/` holds one exported `config.csv` per joint. Motion Master names an export
-after the drive's product ID and serial number (e.g. `6401-01-0000338-2613.config.csv`), which
-says nothing about which physical joint the file belongs to, so matching cannot rely on the
-filename alone.
-
-Every config file — and every live device — carries a human-readable label at `0x20F2:00` in
-the form `"<joint number> <joint name>"`, e.g.:
-
-```
-0x20f2,  0,  104 head_yaw
-```
-
-This script uses that label, not the filename, to pair a config file with a live device. When
-`--device-number` (e.g. `104`) is given, only the joint whose label starts with that number is
-checked; otherwise every config file with a `0x20F2:00` label is checked.
+> **This energizes the drives.** Stage 2 cycles the controlword to Switch on, and Stage 3 enables
+> operation for the homing. Homing method 37 only defines the current position as home and is
+> not meant to move a joint, but run the script yourself at the robot with the approved E-stop/STO
+> within reach.
 
 ---
 
@@ -119,9 +93,12 @@ MOTION_MASTER_HOSTNAME=<host> npx ts-node src/humanoid_bringup/write-drive-confi
 MOTION_MASTER_HOSTNAME=<host> npx ts-node src/humanoid_bringup/write-drive-config.ts \
   --diagnose --device-number 104
 
-# Diagnose, then (after typing "yes" to confirm) write 0x200D:00 on every mismatching device
-# and cycle the controlword 0 -> 6 -> 7 on every matching or mismatching device — after
-# confirming STO is inactive on every device.
+# Commission a new robot, starting with the drive names (Roger-3: IgH positions 0, 3 and 18 are
+# EtherCAT switches). Each stage asks for "yes" first.
+MOTION_MASTER_HOSTNAME=<host> npx ts-node src/humanoid_bringup/write-drive-config.ts \
+  --apply --assign-names --ignore_ecat_indices 0,3,18
+
+# Drives that already carry their names
 MOTION_MASTER_HOSTNAME=<host> npx ts-node src/humanoid_bringup/write-drive-config.ts \
   --apply
 ```
@@ -131,7 +108,15 @@ MOTION_MASTER_HOSTNAME=<host> npx ts-node src/humanoid_bringup/write-drive-confi
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--diagnose` | `false` | Run Stage 0 (read-only polarity check) only. Without it (and without `--apply`), the script does nothing and never connects to Motion Master. |
-| `--apply` | `false` | Runs Stage 0, then Stages 1-5 and 7: confirm, check STO then write polarity + transition, reset home offset to zero and calculate the `+360°` polarity-inversion correction, confirm again to check restore home position, write the offsets and save all parameters on the devices touched, report position, confirm and write + save software position limits, then confirm and apply Quick Stop / SS1 safety configuration via the SMM. |
+| `--apply` | `false` | Runs Stage 0, then Stages 1-5 and 7: assign names (1, with `--assign-names`), confirm, check STO then write the polarity from the config files + transition (2), set the Encoder 2 single turn offset and home every joint at the middle of its single-turn range, failing loudly on a non-zero Home Offset (3), confirm and save, report position (4), confirm and write + save software position limits (5), then confirm and apply Quick Stop / SS1 safety configuration via the SMM (7). |
+| `--assign-names` | `false` | Stage 1: write the joint labels (`0x20F2:00`) from the `position_<NN>_*.csv` files by slave position. Needs `--ignore_ecat_indices` unless every slave on the bus is a drive. |
+| `--ignore_ecat_indices <list>` | *(none)* | Stage 1: comma-separated IgH positions of slaves that are not drives (e.g. Beckhoff EtherCAT switches), which have no config file, e.g. `0,3,18`. |
+| `--samples <n>` | `10` | Stage 3: samples of the Encoder 2 position per drive (5-10). |
+| `--resolution-bits <n>` | `20` | Stage 3: Encoder 2 single-turn resolution in bits; the middle is `2^(n-1)`. |
+| `--max-spread <counts>` | `16` | Stage 3: a drive whose raw Encoder 2 position varies by more than this is refused as moving. |
+| `--tolerance <counts>` | `4` | Stage 3: how far from the middle the read-back adjusted position may be. |
+| `--home-tolerance-deg <deg>` | `0.5` | Stage 3: largest `|Actual position|` after homing that counts as close to 0. |
+| `--pause-ms <ms>` | `2000` | Stage 3: pause after printing each joint's name, before it is processed. |
 | `--device-number <value>` | *(all)* | Only check the joint matching this number at `0x20F2:00`. If omitted, every config file is checked. |
 | `--config-dir <path>` | `drive_configs/` (next to this script) | Directory containing the `*.config.csv` files |
 | `-u, --username <value>` | `Test` | SMM login username, used by Stage 7 |
@@ -164,76 +149,132 @@ Motion Master.
 
 The remaining stages only run with `--apply`.
 
-### Stage 1 — confirm
+### Stage 1 — assign names
+
+Only with `--apply --assign-names`; otherwise this stage prints that it was skipped. The labels
+are the `0x20F2:00` strings (`"<number> <joint name>"`, e.g. `104 head_yaw`) that Stage 0 and
+the later stages match on, so a robot whose drives were never labelled can be named in the same
+run.
+
+> **Applying this step assumes EtherCAT network is wired exactly same between the robots.**
+> **Assuming monotonic cabling and position 0, 3, 18 as EtherCAT switch positions.**
+> Both are printed as a large warning before the table and again before the confirmation (the
+> second line lists whatever you pass to `--ignore_ecat_indices`).
+
+Each file in `drive_configs/` is named `position_<NN>_<name>_config.csv`; `NN` is the position it
+was exported from, and the file's own `0x20F2:00` row holds the label. The label is written to
+the drive at the same position on the connected robot.
+
+**The files and Motion Master count differently.** The files are always generated with the IgH
+master, which counts from 0 and includes every slave on the bus, such as the Beckhoff EtherCAT
+switches. On Roger-3 positions 0, 3 and 18 are switches, so they have no file and the file
+numbers have gaps. OBLAC's Motion Master uses SOEM, which only reports the drives. Pass the IgH
+positions of the slaves that are not drives with `--ignore_ecat_indices`; the file position is
+converted to a drive number by taking out the ignored positions that come before it. With
+`--ignore_ecat_indices 0,3,18`:
+
+| File | Drive on the network |
+|---|---|
+| `position_01_*` | 1st (position 0 is before it) |
+| `position_02_*` | 2nd |
+| `position_04_*` | 3rd (positions 0 and 3 are before it) |
+| `position_19_*` | 17th (positions 0, 3 and 18 are before it) |
+| `position_33_*` | 31st, the last |
+
+"Nth drive" is the Nth device in bus order, so SOEM's 1-based and IgH's 0-based numbering make no
+difference. Without the flag nothing is ignored and position 0 is the 1st drive. The step is only
+correct when the cabling is monotonic, i.e. the drives are wired in the same order as on the robot
+the files came from.
+
+It prints the pairing table (file position, drive number, current label, new label), warns when
+the number of drives differs from the number of config files, and asks for `yes`. Each label is
+written, read back, and the drive's parameters saved. A file at an ignored position, a file with
+no drive at its position, two files claiming one position or two files with the same joint number
+is reported, and any failure stops the run. Afterwards Stage 0 is repeated so the later stages
+see the new names.
+
+### Stage 2 — apply the polarity from the config files
 
 Every `MATCH` or `MISMATCH` row is eligible; if there are none, prints "nothing to apply" and
-stops (Stages 2-5 and 7 don't run). `NO LIVE DEVICE` / `NO FILE POLARITY` / `AMBIGUOUS CONFIG` /
-`AMBIGUOUS DEVICE` rows are never eligible. Otherwise prints the list of eligible joints
-(current vs. new value, and whether each will get `WRITE + TRANSITION` or `TRANSITION ONLY`)
-and prompts `Type "yes" to proceed on these N device(s), anything else to abort:`. Anything
-other than exactly `yes` aborts with no changes made (Stages 2-5 and 7 don't run).
-
-### Stage 2 — check STO, apply polarity, controlword transition
+stops. `NO LIVE DEVICE` / `NO FILE POLARITY` / `AMBIGUOUS CONFIG` / `AMBIGUOUS DEVICE` rows are
+never eligible. Otherwise prints the list of eligible joints (current vs. new value, and whether
+each will get `WRITE + TRANSITION` or `TRANSITION ONLY`) and prompts
+`Type "yes" to proceed on these N device(s), anything else to abort:`. Anything other than
+exactly `yes` aborts with no changes made.
 
 1. **Checks STO** (Safe Torque Off — bit 0 of `0x6621:01`) on every eligible device. If STO is
    active, or its status can't be read, on *any* device, throws immediately — naming every
    affected device — which aborts the whole `--apply` run with `[FATAL] ...` before anything is
    written. This is because the controlword transition below cannot succeed while STO is active.
-2. For each `MISMATCH` device: writes `0x200D:00` via a plain SDO download and reads it back to
-   verify. For each `MATCH` device, nothing is written. Then, for every eligible device (provided
-   the `MISMATCH` write/verify above succeeded), cycles the controlword (`0x6040:00`) through
-   `0 -> 6 -> 7` — clear, Shutdown, Switch On, 200 ms apart. Prints a per-device summary
-   (`APPLIED` / `TRANSITIONED` / `VERIFY FAILED` / `WRITE FAILED` /
-   `POLARITY WRITTEN, CONTROLWORD TRANSITION FAILED` / `CONTROLWORD TRANSITION FAILED`). No
-   save/persist command is issued in this stage — the polarity value is live-only for now, and
-   reverts on the next power cycle or config reload *unless* Stage 4 or Stage 5 later saves that
-   device (see the persistence note above).
+2. For each `MISMATCH` device: writes `0x200D:00` (the polarity from the config file) via a plain
+   SDO download and reads it back to verify. For each `MATCH` device, nothing is written. Then,
+   for every eligible device (provided the `MISMATCH` write/verify above succeeded), cycles the
+   controlword (`0x6040:00`) through `0 -> 6 -> 7` — clear, Shutdown, Switch On, 200 ms apart.
+   Prints a per-device summary (`APPLIED` / `TRANSITIONED` / `VERIFY FAILED` / `WRITE FAILED` /
+   `POLARITY WRITTEN, CONTROLWORD TRANSITION FAILED` / `CONTROLWORD TRANSITION FAILED`). The
+   polarity is saved by Stage 3.
 
-### Stage 3 — reset home offset and calculate polarity-inversion correction
+### Stage 3 — set the Encoder 2 single turn offset and home
 
-**Only** for devices with status `MISMATCH` — `MATCH` devices had nothing written to them in
-Stage 2 and are left alone entirely here, not even listed. Of the `MISMATCH` devices, only
-those whose Stage 2 status was `APPLIED` are processed; the rest are reported as `SKIPPED`.
+Start with the humanoid **mechanically zeroed (or at the zero you want)**: every joint is homed
+where it is, so that position becomes zero. The Home Offset is not used to move the zero — no
+correction is added to it.
 
-Inverting system polarity at a non-zero angle adds a full revolution to the Actual position
-value, regardless of direction: at `+90°`, inverting moves it to `-(360+90) = -450°` (not
-`-90°`); at `-90°`, it moves to `-(360-90) = -270°` (not `+90°`). In both cases the correction
-is the same fixed `+360°` worth of counts — it does **not** depend on the position's sign or
-magnitude. For that correction to be exact regardless of whatever was already on the device:
+The goal is to set Encoder 2 single turn offset (`0x2112:06`) so that Encoder 2 feedback
+Adjusted position (`0x2113:02`) is exactly 2^19, the middle of a 2^20 range, giving the joint
+the maximum range of motion without the single-turn value overflowing.
 
-1. **Checks the device's current home offset (`0x607C:00`)** and, if it isn't already `0`,
-   **writes it to `0`** and verifies the readback — the only write this stage makes. If that
-   verification fails, the device is reported `RESET TO ZERO FAILED` and skipped.
-2. Reads the Actual position value (`0x6064:00`) and converts it to degrees, **assuming a
-   20-bit position encoder** (1,048,576 counts/revolution, logged as `[INFO]`) — purely for the
-   printed table; it no longer affects the calculation.
-3. Calculates the pending home offset as `+360°` worth of counts (i.e. `0 + 360°`, since the
-   offset was just reset) for **every** device that reaches this point.
-4. Prints a summary table — device number, joint label, home offset before the reset (in
-   degrees), position in degrees, and status (`RESET TO 0, +360° PENDING IN STAGE 4` /
-   `RESET TO ZERO FAILED (...)` / `SKIPPED (stage 2 did not complete)` / `FAILED (...)`).
+**Planning (read-only), for every joint that completed Stage 2:**
 
-### Stage 4 — apply home offsets, save, and report actual position
+1. Reads `--samples` (5-10, default 10) samples of the raw (`0x2113:01`) and adjusted
+   (`0x2113:02`) position. A drive whose raw value varies by more than `--max-spread` counts
+   (default 16) is refused as moving, and so is one that is operation enabled or in fault.
+2. Calculates the offset from the raw position:
 
-1. If Stage 3 calculated no corrections, prints "no home offset corrections to apply" and
-   skips straight to the position report (step 5 below).
-2. Otherwise prints the list of devices that would be changed (position, and the calculated new
-   home offset in counts) and prompts
-   `Type "yes" to apply these N home offset adjustment(s) and save all parameters, anything else to abort:`.
-   Anything other than exactly `yes` aborts — no home offset is written and nothing is saved
-   (the position report in step 5 still runs).
-3. On confirmation, **checks restore home position (`0x2005:02`) on every device that went
-   through Stage 2** (`MATCH` and `MISMATCH` alike) and prints the result. If any device reads
-   anything other than `1` (including a read failure), the whole save step is refused — no
-   home offset is written and nothing is saved (the position report in step 5 still runs).
-4. Otherwise, for each flagged device: writes the calculated home offset (`0x607C:00`) via a
-   plain SDO download and reads it back to verify. **Only once verified**, calls `saveConfig`
-   (`0x1010`: Store parameters) to persist that device's entire current parameter set — which
-   also makes its Stage 2 polarity write persistent. Prints a per-device summary
-   (`APPLIED & SAVED` / `APPLIED, SAVE FAILED (...)` / `VERIFY FAILED` / `WRITE FAILED`).
-5. Reads the Actual position value (`0x6064:00`) again and prints it in degrees for **every**
-   device that went through Stage 2 — `MATCH` and `MISMATCH` alike, regardless of what happened
-   above — so you can see where every joint stands after the whole process.
+   ```
+   IF raw < resolution / 2    offset = raw + 2^19
+   ELSE                       offset = raw - 2^19
+   ```
+
+3. Prints a table: adjusted position before, raw position, offset now, calculated offset, the
+   adjusted position expected afterwards (`2^19`), the Home Offset now, and a status.
+   A joint that cannot be processed stops the stage before anything is written — homing only
+   some of the joints would leave the robot half-commissioned.
+4. Prints a large warning, because the drives are energized, and asks for `yes`.
+
+**Per joint, one after the other** — its assigned name is printed first, followed by a pause of
+`--pause-ms` (default 2000 ms) so you can see which joint it is:
+
+1. If the Home Offset (`0x607C:00`) is not `0` (e.g. a loaded config carries one), it is reset
+   to `0` and read back. This is reported as a warning.
+2. Writes `0x2112:06` and sets *Restore home position when loading configuration* (`0x2005:02`)
+   to `1` (YES), saves all parameters (`0x1010`), then reads `0x2113:02` back. It must be `2^19`
+   within `--tolerance` counts (default 4); on anything else the previous offset and restore flag
+   are written back and saved, and the run stops.
+3. **Homes at the current position with method 37**: Modes of operation (`0x6060:00`) = 6,
+   Homing method (`0x6098:00`) = 37, controlword `0x06 -> 0x07 -> 0x0F`, then `0x1F` to start
+   homing, and waits for Homing attained (statusword bit 12). Method 37 only defines the current
+   position as home and is not meant to move the joint, but the drive is energized. Afterwards the
+   drive is returned to Switched on disabled and its previous mode of operation is restored, also
+   when the homing failed.
+4. **Checks that the Home Offset (`0x607C:00`) is still `0`**. If not, the run **fails loudly**:
+   a large warning naming the joint and the value, and the run stops. It also checks that the
+   Actual position (`0x6064:00`) is within `--home-tolerance-deg` (default 0.5°) of 0.
+
+The stage stops at the first joint that fails, prints the summary table, and throws, so Stages 4,
+5 and 7 do not run.
+
+The calculation assumes the adjusted position is the raw position minus the offset. The script
+warns when a drive does not behave that way, and the read-back after writing catches it.
+`--resolution-bits` (default 20) sets the single-turn resolution if your encoder differs.
+
+### Stage 4 — save and report actual position
+
+Asks for `yes`, then saves all parameters (`0x1010`: Store parameters) on every homed device, so
+the homed position persists (Restore home position is `1`), and prints each device's Actual
+position (`0x6064:00`, in degrees, assuming a 20-bit position encoder) and Home Offset
+(`0x607C:00`). A Home Offset that is not `0` fails loudly. Answering anything but `yes` skips the
+save and only reports.
 
 ### Stage 5 — apply and save software position limits
 
@@ -318,101 +359,11 @@ Discovered 31 device(s) on the network.
 ================
 ```
 
-With `--apply`, the run above continues (after the summary) with every `MATCH`/`MISMATCH`
-joint — here 3 `MATCH` and 1 `MISMATCH`:
+With `--apply`, the run continues with Stages 1-4. Their output has not been captured from a robot
+yet, so it is not reproduced here; the tables are described in the stage sections above. Stages 5
+and 7 look like this:
 
 ```
-=== Stage 1: Confirm applying polarity changes ===
-
-The following 4 joint(s) will have their controlword cycled 0 -> 6 -> 7, and 1 of them will
-first have 0x200D:00 written to match their config file:
-
-┌─────────┬────────┬────────────────────┬───────────────────┬──────────────────┬─────────────────────┐
-│ (index) │ Device │ Joint              │ Current (device)   │ New (from file)  │ Action              │
-├─────────┼────────┼────────────────────┼───────────────────┼──────────────────┼─────────────────────┤
-│ 0       │ '101'  │ '101 torso_yaw'    │ '0 (normal)'       │ '0 (normal)'     │ 'TRANSITION ONLY'   │
-│ 1       │ '102'  │ '102 torso_right'  │ '1 (inverted)'     │ '1 (inverted)'   │ 'TRANSITION ONLY'   │
-│ 2       │ '103'  │ '103 torso_left'   │ '0 (normal)'       │ '0 (normal)'     │ 'TRANSITION ONLY'   │
-│ 3       │ '104'  │ '104 head_yaw'     │ '1 (inverted)'     │ '0 (normal)'     │ 'WRITE + TRANSITION'│
-└─────────┴────────┴────────────────────┴───────────────────┴──────────────────┴─────────────────────┘
-
-Mismatching devices get 0x200D:00 written directly to their live parameter set only — NOT saved/persisted.
-Every listed device then has its controlword (0x6040:00) cycled 0 -> 6 -> 7.
-
-Type "yes" to proceed on these 4 device(s), anything else to abort: yes
-
-=== Stage 2: Apply polarity changes and controlword transition ===
-
-=== Apply summary ===
-┌─────────┬────────┬────────────────────┬────────────────┐
-│ (index) │ Device │ Joint              │ Status         │
-├─────────┼────────┼────────────────────┼────────────────┤
-│ 0       │ '101'  │ '101 torso_yaw'    │ 'TRANSITIONED' │
-│ 1       │ '102'  │ '102 torso_right'  │ 'TRANSITIONED' │
-│ 2       │ '103'  │ '103 torso_left'   │ 'TRANSITIONED' │
-│ 3       │ '104'  │ '104 head_yaw'     │ 'APPLIED'      │
-└─────────┴────────┴────────────────────┴────────────────┘
-Reminder: polarity writes were NOT saved — they apply only until the next power cycle or config reload.
-
-=== Stage 3: Reset home offset and calculate polarity-inversion correction ===
-
-[INFO] Inverting system polarity at a non-zero angle adds a full revolution to the Actual
-position value, in either direction. Every inverted device's home offset (0x607C:00) is
-first reset to 0 (if not already), then corrected by +360° worth of counts (assuming a
-20-bit position encoder, 1048576 counts/revolution).
-
-┌─────────┬────────┬────────────────┬─────────────────────────┬────────────────┬───────────────────────────────────────┐
-│ (index) │ Device │ Joint          │ Home Offset Before (deg)│ Position (deg) │ Status                                 │
-├─────────┼────────┼────────────────┼─────────────────────────┼────────────────┼───────────────────────────────────────┤
-│ 0       │ '104'  │ '104 head_yaw' │ '0.00'                  │ '-450.00'      │ 'RESET TO 0, +360° PENDING IN STAGE 4' │
-└─────────┴────────┴────────────────┴─────────────────────────┴────────────────┴───────────────────────────────────────┘
-
-=== Stage 4: Apply home offsets and report actual position ===
-
-The following 1 device(s) will have their home offset (0x607C:00) adjusted:
-
-┌─────────┬────────┬────────────────┬─────────────────┬───────────────────────────┐
-│ (index) │ Device │ Joint          │ Position (deg)  │ New Home Offset (counts)  │
-├─────────┼────────┼────────────────┼─────────────────┼───────────────────────────┤
-│ 0       │ '104'  │ '104 head_yaw' │ '-450.00'        │ 1048576                   │
-└─────────┴────────┴────────────────┴─────────────────┴───────────────────────────┘
-
-Once written and verified, ALL parameters currently on each device — including this home
-offset and any polarity change from Stage 2 — will be SAVED (0x1010: Store parameters), so
-they persist across a power cycle.
-
-Type "yes" to apply these 1 home offset adjustment(s) and save all parameters, anything else to abort: yes
-
-Checking restore home position (0x2005:02) on all 4 drive(s) before saving...
-
-┌─────────┬────────┬────────────────────┬────────────────────────────────┬────────┐
-│ (index) │ Device │ Joint              │ Restore Home Position (0x2005:02) │ Status │
-├─────────┼────────┼────────────────────┼────────────────────────────────┼────────┤
-│ 0       │ '101'  │ '101 torso_yaw'    │ 1                                │ 'OK'   │
-│ 1       │ '102'  │ '102 torso_right'  │ 1                                │ 'OK'   │
-│ 2       │ '103'  │ '103 torso_left'   │ 1                                │ 'OK'   │
-│ 3       │ '104'  │ '104 head_yaw'     │ 1                                │ 'OK'   │
-└─────────┴────────┴────────────────────┴────────────────────────────────┴────────┘
-
-=== Home offset apply summary ===
-┌─────────┬────────┬────────────────┬────────────────┐
-│ (index) │ Device │ Joint          │ Status         │
-├─────────┼────────┼────────────────┼────────────────┤
-│ 0       │ '104'  │ '104 head_yaw' │ 'APPLIED & SAVED' │
-└─────────┴────────┴────────────────┴────────────────┘
-Parameters were saved (0x1010) on every successfully applied device — they now persist across a power cycle.
-
-Actual position for all devices:
-
-┌─────────┬────────┬────────────────────┬─────────────────┐
-│ (index) │ Device │ Joint              │ Position (deg)  │
-├─────────┼────────┼────────────────────┼─────────────────┤
-│ 0       │ '101'  │ '101 torso_yaw'    │ '2.15'          │
-│ 1       │ '102'  │ '102 torso_right'  │ '-0.87'         │
-│ 2       │ '103'  │ '103 torso_left'   │ '0.00'          │
-│ 3       │ '104'  │ '104 head_yaw'     │ '-90.00'        │
-└─────────┴────────┴────────────────────┴─────────────────┘
-
 === Stage 5: Apply software position limits ===
 
 [INFO] Assuming a 20-bit position encoder (1048576 counts/revolution) to convert 0x607D:01/02 to degrees.
@@ -476,30 +427,21 @@ Quick stop / ASC duration were saved (0x1010). SS1 safety parameters were valida
 SMM configuration flow — both are now persistent on every successfully applied device.
 ```
 
-Note the 3 `MATCH` joints (101, 102, 103) don't appear in Stage 3 at all — only `MISMATCH`
-devices are ever considered there. All 4 devices reappear in Stage 4's, Stage 5's, and Stage
-7's tables, since all three cover every device that went through Stage 2. Device 104 was at
-`+90°` before its polarity inverted in Stage 2, which (with no correction) would display as
-`-450°`; Stage 3 reset its home offset to `0` and calculated `+360°`, and Stage 4 applied that,
-landing the reported position at `-90°` — the negated original angle, as expected. Every device
-in this run ends up saved: device 104 by Stage 4 (which also persists
-its Stage 2 polarity write), every device by Stage 5 (which persists whatever's live on it at
-that point, including any Stage 4 changes), and devices 101/103 additionally by Stage 7 (which
-only touches devices whose quick-stop/SS1 values weren't already at target) — so nothing here
-reverts on the next power cycle.
+Stages 5 and 7 cover every device that went through Stage 2. Devices 101/103 are saved by Stage 7
+only when their quick-stop/SS1 values were not already at target.
 
 ### If STO is active
 
 If any device's Safe Torque Off is active when Stage 2 runs, the whole `--apply` run stops
-immediately, before Stage 1's confirmed changes are written:
+immediately, before anything in Stage 2 is written:
 
 ```
-=== Stage 2: Apply polarity changes and controlword transition ===
+=== Stage 2: Apply system polarity from the config files ===
 
 [FATAL] STO (Safe Torque Off) is active on: 104 (104 head_yaw). The controlword transition 0 -> 6 -> 7 cannot succeed while STO is active. Release STO on the affected device(s) and re-run --apply.
 ```
 
-Release STO on the named device(s) and re-run `--apply` — Stage 1 will need to be confirmed
+Release STO on the named device(s) and re-run `--apply` — the stages will need to be confirmed
 again, since nothing from that run was written.
 
 ---
@@ -521,8 +463,9 @@ the filename when a file has no label row yet.
 ### 2. Label every drive and every config file
 
 Matching is done on the `0x20F2:00` label, in the form `"<number> <joint name>"`. Run
-[`assign-names.ts`](#assign-namests) (step 1) to write the labels to a robot's drives in one
-command, taken from the config files:
+`write-drive-config.ts --apply --assign-names` ([Stage 1](#stage-1--assign-names)) to write the
+labels to a robot's drives in one command, taken from the config files, which must then be named
+`position_<NN>_<name>_config.csv` after the IgH position they were exported from:
 
 ```
 0x20f2,  0,  104 head_yaw
@@ -543,168 +486,23 @@ the same network is harmless.
 
 | What | Where | Why it matters |
 |---|---|---|
-| **Encoder resolution** | `ASSUMED_ENCODER_RESOLUTION_BITS` in `write-drive-config.ts` (20 bits) | Stages 3 and 4 convert between counts and degrees. A drive with a different resolution gets a wrong home offset correction, so set this to your encoders or make it per-joint. |
-| **Polarity-inversion correction** | `HOME_OFFSET_ADJUSTMENT_DEGREES` (360°) | Inverting polarity at a non-zero angle shifts the actual position by a full revolution. Correct for a rotary joint; revisit for a linear axis. |
+| **Encoder resolution** | `ASSUMED_ENCODER_RESOLUTION_BITS` in `write-drive-config.ts` (20 bits) | Stages 3-5 convert the Actual position and the software position limits between counts and degrees. A drive with a different resolution gets wrong degrees, so set this to your encoders or make it per-joint. (The Encoder 2 single-turn resolution used in Stage 3 is `--resolution-bits`.) |
+| **Home Offset** | Stage 3 | No correction is added to the Home Offset (`0x607C:00`): it must be `0` after homing, otherwise the run fails loudly. Note that some exported configs carry one (Roger-3: `1048576`, i.e. 360°, in 5 of the files) — Stage 3 resets it to `0` before homing, and `load-drive-configs.ts --exclude 0x607C` keeps it from being loaded. |
 | **Quick stop / SS1 targets** | The Stage 7 constants | These are commissioned values, not defaults. Confirm them against your own safety concept before applying. |
 | **SMM credentials** | `--username` / `--password` (default `Test` / `SomanetSMM`) | Stage 7 needs the real credentials for your drives. |
 
 ### 4. Bring up in this order
 
-1. `assign-names.ts --dry-run`, then `assign-names.ts` — label every drive by slave position
-   (see [assign-names.ts](#assign-namests)). Skip this if the drives already carry their labels.
-2. `load-drive-configs.ts --dry-run` — check the pairing table before writing anything.
-3. `load-drive-configs.ts --exclude ...` — load the configs, excluding per-drive calibration
+1. `load-drive-configs.ts --dry-run` — check the pairing table before writing anything. (On a
+   robot whose drives are not named yet, the pairing needs Stage 1 first: use step 3 with
+   `--assign-names`.)
+2. `load-drive-configs.ts --exclude ...` — load the configs, excluding per-drive calibration
    values (see below).
-4. `set-encoder-st-offset.ts --dry-run`, then `set-encoder-st-offset.ts` — with every
-   joint at its home position, centre the Encoder 2 single-turn range (see
-   [set-encoder-st-offset.ts](#set-encoder-st-offsetts)).
-5. `home-joints.ts --dry-run`, then `home-joints.ts` — home each joint at its current position
-   (method 37), one after the other (see [home-joints.ts](#home-jointsts)).
-6. `write-drive-config.ts --diagnose` — read-only polarity check.
-7. `write-drive-config.ts --apply` — staged, each stage confirmed.
-
----
-
-## assign-names.ts
-
-Labels every drive in one command, so a new robot can be named without one `0x20F2:00` write
-per drive.
-
-```
-# Read-only: show which drive would get which label
-npx ts-node src/humanoid_bringup/assign-names.ts --ignore_ecat_indices 0,3,18 --dry-run
-
-# Assign every label (asks for "yes" first)
-npx ts-node src/humanoid_bringup/assign-names.ts --ignore_ecat_indices 0,3,18
-
-# One file position only (the IgH position from the filename)
-npx ts-node src/humanoid_bringup/assign-names.ts --slave-position 7
-
-# Nothing to ignore (every slave on the bus is a drive)
-npx ts-node src/humanoid_bringup/assign-names.ts
-```
-
-> **Applying this step assumes EtherCAT network is wired exactly same between the robots.**
-> **Assuming monotonic cabling and position 0, 3, 18 as EtherCAT switch positions.**
-> The script prints both (the second one lists whatever you pass to `--ignore_ecat_indices`) as a large warning before the table and again before asking for
-> confirmation.
-
-Each file in `drive_configs/` is named `position_<NN>_<name>_config.csv`; `NN` is the position
-it was exported from, and the file's own `0x20F2:00` row holds the label.
-
-**The files and Motion Master count differently.** The files are always generated with the IgH
-master, which counts from 0 and includes every slave on the bus, such as the Beckhoff EtherCAT
-switches. On Roger-3 positions 0, 3 and 18 are switches, so they have no file and the file
-numbers have gaps. OBLAC's Motion Master uses SOEM, which only reports the drives. Pass the IgH
-positions of the slaves that are not drives with `--ignore_ecat_indices` (comma-separated); the
-script converts the file position to a drive number by taking out the ignored positions that
-come before it. With `--ignore_ecat_indices 0,3,18`:
-
-| File | Drive on the network |
-|---|---|
-| `position_01_*` | 1st (position 0 is before it) |
-| `position_02_*` | 2nd |
-| `position_04_*` | 3rd (positions 0 and 3 are before it) |
-| `position_19_*` | 17th (positions 0, 3 and 18 are before it) |
-| `position_33_*` | 31st, the last |
-
-"Nth drive" is the Nth device in bus order, so SOEM's 1-based and IgH's 0-based numbering make
-no difference. Without the flag nothing is ignored and position 0 is the 1st drive. The step is only correct when the cabling is monotonic, i.e. the drives are wired
-in the same order as on the robot the files came from.
-
-- After each write the label is read back, then the drive's parameters are saved
-  (`0x1010: Store parameters`), so the label survives a power cycle.
-- A file at an ignored position, a file with no drive at its position, two files claiming one
-  position, or two files with the same joint number is reported and skipped.
-- Drives with no file are left untouched.
-- It warns when the number of drives on the network differs from the number of config files
-  (31 for Roger-3), which is the usual sign it is not the same robot.
-
-Check the table against the physical robot before typing `yes`: a drive in the wrong place gets
-the wrong name, and every later step trusts that name.
-
----
-
-## set-encoder-st-offset.ts
-
-Moves the Encoder 2 actual position to the middle of its single-turn range, so the joint gets
-the maximum range of motion without the single-turn value overflowing. It sets Encoder 2 single
-turn offset (`0x2112:06`) so that Encoder 2 feedback Adjusted position (`0x2113:02`) is exactly
-2^19, the middle of a 2^20 range.
-
-**Move every joint to its home position first** — the script cannot do that.
-
-```
-# Read-only: table of the adjusted position now, the calculated ST offset and the expected
-# adjusted position (2^19). Nothing is written and there is no homing.
-npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts --dry-run
-
-# Set and save (asks for "yes" first); one joint with --device-number 104
-npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts
-```
-
-Per drive:
-
-1. Reads `--samples` (5-10, default 10) samples of the raw (`0x2113:01`) and adjusted
-   (`0x2113:02`) position. A drive whose raw value varies by more than `--max-spread` counts
-   (default 16) is skipped as moving, and so is one that is operation enabled.
-2. Calculates the offset from the raw position:
-
-   ```
-   IF raw < resolution / 2    offset = raw + 2^19
-   ELSE                       offset = raw - 2^19
-   ```
-
-3. Writes `0x2112:06` and sets *Restore home position when loading configuration*
-   (`0x2005:02`) to 1 (YES), saves all parameters (`0x1010`), then reads `0x2113:02` back. The
-   drive counts as a success only when it reads 2^19 within `--tolerance` counts (default 4). On
-   anything else the previous offset and restore flag are written back and saved.
-This step only reads and writes parameters and never energizes a drive. Homing is the next step,
-[`home-joints.ts`](#home-jointsts).
-
-The calculation assumes the adjusted position is the raw position minus the offset. The script
-warns when a drive does not behave that way, and the read-back after writing catches it. A
-`--resolution-bits` (default 20) sets the single-turn resolution if your encoder differs.
-
----
-
-## home-joints.ts
-
-Homes every joint at its current position with **method 37**, one after the other. Before each
-joint it prints the joint's assigned name and pauses, so whoever is at the robot can see which one
-is being homed:
-
-```
->>> [3/31] HOMING NOW: 105 head_pitch <<<
-    HOMED (actual position 0.004°, home offset 0x607C:00 = 0)
-```
-
-```
-# List the joints and the order, nothing is written
-npx ts-node src/humanoid_bringup/home-joints.ts --dry-run
-
-# Home every labelled joint (asks for "yes" first)
-npx ts-node src/humanoid_bringup/home-joints.ts
-
-# One joint, or a longer pause (default 2000 ms) between joints
-npx ts-node src/humanoid_bringup/home-joints.ts --device-number 104
-npx ts-node src/humanoid_bringup/home-joints.ts --pause-ms 5000
-```
-
-For each joint, in bus order: Modes of operation (`0x6060:00`) = 6 (Homing), Homing method
-(`0x6098:00`) = 37, controlword `0x06 -> 0x07 -> 0x0F`, then `0x1F` to start homing and wait for
-Homing attained (statusword bit 12). The Actual position (`0x6064:00`) is then reported in degrees
-and should be within `--home-tolerance-deg` (default 0.5°) of 0. Afterwards the drive is returned
-to Switched on disabled and its previous mode of operation is restored, also when homing failed.
-
-It stops at the first joint that fails and leaves the rest alone. Ctrl-C stops after the joint
-being homed. A drive that is already operation enabled or in fault is not touched.
-
-> **This energizes each drive, one at a time** (Operation enabled, Homing mode). Method 37 only
-> defines the current position as home and is not meant to move the joint, but run it yourself at
-> the robot with the approved E-stop/STO within reach, and only once every joint is where it
-> should be when it becomes home. A non-zero home offset (`0x607C:00`) shifts the position
-> reported afterwards; it is printed.
+3. `write-drive-config.ts --diagnose` — read-only polarity check.
+4. With every joint mechanically zeroed (or at the zero you want):
+   `write-drive-config.ts --apply [--assign-names --ignore_ecat_indices 0,3,18]` — staged, each
+   stage confirmed: names (1), polarity (2), Encoder 2 single turn offset and homing (3), save
+   (4), limits (5), safety (7).
 
 ---
 

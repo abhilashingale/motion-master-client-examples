@@ -13,32 +13,38 @@
  * The console output is split into numbered stages so the process is easy to follow:
  *   Stage 0 (--diagnose and --apply): diagnose current polarity and compare it against the
  *     config files by joint name. Read-only.
- *   Stage 1 (--apply only): ask for confirmation before applying any polarity change.
- *   Stage 2 (--apply only): before cycling the controlword, checks STO (Safe Torque Off — bit 0
- *     of the Safety Statusword's first byte, 0x6621:01) on every device; if STO is active (or
+ *   Stage 1 (--apply with --assign-names): write each drive's joint label (0x20F2:00) from the
+ *     `position_<NN>_*.csv` files, by position in the EtherCAT chain, so a robot whose drives
+ *     were never labelled can be named in the same run. The files come from the IgH master
+ *     (positions count from 0 and include slaves that are not drives, e.g. EtherCAT switches),
+ *     while Motion Master here runs SOEM and only reports the drives: pass the IgH positions of
+ *     the slaves that are not drives with --ignore_ecat_indices (Roger-3: 0,3,18). A file's
+ *     position becomes a drive index by taking out the ignored positions before it. Prints a
+ *     large warning that the EtherCAT network must be wired exactly the same as on the robot the
+ *     files came from and that cabling is assumed monotonic. After the labels are saved, Stage 0
+ *     is run again so the later stages see the new names.
+ *   Stage 2 (--apply only): ask for confirmation, then check STO (Safe Torque Off — bit 0 of the
+ *     Safety Statusword's first byte, 0x6621:01) on every device; if STO is active (or
  *     unreadable) on any of them, the run aborts with a warning to release STO, since the
- *     transition cannot succeed while STO is active. Otherwise writes the polarity change
- *     (MISMATCH devices only) and cycles the controlword 0 -> 6 -> 7 on every MATCH/MISMATCH
- *     device. This write is NOT saved/persisted by itself — UNLESS Stage 4 later saves that
- *     same device (see below).
- *   Stage 3 (--apply only): ONLY for devices whose polarity did NOT match their config file
- *     (MISMATCH) that completed Stage 2 — MATCH devices are left alone entirely. Inverting
- *     system polarity at a non-zero angle adds a full revolution to the Actual position value
- *     (e.g. +90° -> -450°, or -90° -> -270°), always correctable by +360° worth of counts on
- *     the home offset. To make that correction exact regardless of prior state, this stage
- *     CHECKS the device's home offset (0x607C:00) and WRITES it to 0 if it isn't already (the
- *     only write this stage makes), then reads the Actual position value (0x6064:00) — for the
- *     printed table only, assuming a 20-bit encoder — and CALCULATES the pending home offset as
- *     +360 degrees worth of counts. Devices needing no correction never occur here since every
- *     MISMATCH/APPLIED device gets the same fixed correction.
- *   Stage 4 (--apply only): ask for confirmation, then — provided restore home position
- *     (0x2005:02) reads 1 on every device that went through Stage 2 (checked and printed as a
- *     precondition; if not, the whole save step is refused) — write the home offset
- *     adjustments Stage 3 calculated and, once verified, SAVE ALL PARAMETERS on that device
- *     (0x1010: Store parameters) — which also persists that device's Stage 2 polarity write,
- *     since save-config persists the entire current parameter set, not just the home offset.
- *     Finally, read and print the Actual position value (0x6064:00), in degrees, for every
- *     device that went through Stage 2 (both MATCH and MISMATCH), regardless of the above.
+ *     transition cannot succeed while STO is active. Otherwise writes the system polarity from
+ *     the config file (MISMATCH devices only) and cycles the controlword 0 -> 6 -> 7 on every
+ *     MATCH/MISMATCH device. The polarity is saved in Stage 3.
+ *   Stage 3 (--apply only): for every joint that completed Stage 2, centre the Encoder 2 single
+ *     turn range and home the joint there. Read --samples (5-10) samples of Encoder 2 feedback Raw
+ *     (0x2113:01) and Adjusted (0x2113:02) position per drive, calculate the single turn offset
+ *     (IF raw < resolution/2 THEN raw + 2^19 ELSE raw - 2^19) and print a table with the adjusted
+ *     position expected afterwards (2^19). After confirmation, joint by joint (its assigned name
+ *     is printed, followed by a pause): make sure the Home Offset (0x607C:00) is 0, write 0x2112:06
+ *     and Restore home position (0x2005:02) = 1, save all parameters, read 0x2113:02 back (it must
+ *     be 2^19, otherwise the previous values are restored), then home at the current position with
+ *     method 37 (Homing method 0x6098:00 = 37, controlword 6 -> 7 -> 15 -> 31). Homing is not
+ *     meant to move the joint, but the drive IS energized. NO home offset correction is made: when
+ *     the homing is done the Home Offset must still be 0 and the Actual position close to 0,
+ *     otherwise the run FAILS LOUDLY and stops. Each drive is returned to Switched on disabled.
+ *     Start with the robot mechanically zeroed (or at the zero you want).
+ *   Stage 4 (--apply only): ask for confirmation, then SAVE ALL PARAMETERS on every homed device
+ *     (0x1010: Store parameters) so the homed position persists, and print the Actual position
+ *     (0x6064:00) and Home Offset (0x607C:00); a non-zero Home Offset fails loudly.
  *   Stage 5 (--apply only): ask for confirmation, then write the software position limits
  *     (0x607D:01 min, 0x607D:02 max) from each device's matched config file to that device, for
  *     every device that went through Stage 2 whose config file has both values, and — once
@@ -58,23 +64,13 @@
  * With `--diagnose` only, Stage 0 does NOT write anything to the device — it only reads and
  * reports.
  *
- * Steps (Stage 0):
- *   1. Scan `drive_configs/*.config.csv` and read the 0x20F2:00 label (and 0x200D:00
- *      system polarity) of every file.
- *   2. Discover devices on the network and read the 0x20F2:00 label (and 0x200D:00 system
- *      polarity) of every live device.
- *   3. Pair each config file with the live device sharing the same joint number, and print a
- *      table plus a summary of how many joints matched, mismatched, or couldn't be paired.
+ * `--apply` runs Stage 0 first, then Stages 1-5 and 7 (there is no Stage 6). A failure in
+ * Stages 1-4 throws and stops the run, so the later stages never run on a half-commissioned
+ * robot. Stage 3 and 4 make the parameter writes persistent (0x1010); the polarity is written in
+ * Stage 2 and saved in Stage 3.
  *
- * `--apply` runs Stage 0 first, then Stages 1-5 and 7 (there is no Stage 6). Stage 2's polarity
- * write, Stage 3's home-offset-reset-to-zero write, Stage 4's home offset write, and Stage 5's
- * software position limit write are plain SDO downloads to the device's live parameter set. A
- * device's parameters become persistent if either Stage 4 reaches its save step for that device
- * (requires the device to have gone through Stage 3's correction, the restore-home-position
- * precondition, AND confirmation) or Stage 5 saves it (requires its config file to have both
- * software position limits AND confirmation). Stage 7 saves its own non-safety objects directly
- * and persists its safety objects via the SMM
- * validation flow, independent of Stages 4/5.
+ * This script ENERGIZES the drives (Stage 2 cycles the controlword to Switch on; Stage 3 enables
+ * operation for homing). Run it yourself at the robot with the approved E-stop/STO within reach.
  *
  * Usage:
  *   # Check every joint in drive_configs against the live session
@@ -83,9 +79,10 @@
  *   # Check only one joint
  *   npx ts-node src/humanoid_bringup/write-drive-config.ts --diagnose --device-number 104
  *
- *   # Diagnose, then (after confirmation) write 0x200D:00 on every mismatching device and
- *   # cycle the controlword 0 -> 6 -> 7 on every matching or mismatching device.
- *   # Polarity writes are NOT saved/persisted.
+ *   # Full commissioning of a new robot, starting with the names (Roger-3: IgH 0, 3, 18 are switches)
+ *   npx ts-node src/humanoid_bringup/write-drive-config.ts --apply --assign-names --ignore_ecat_indices 0,3,18
+ *
+ *   # Drives already named
  *   npx ts-node src/humanoid_bringup/write-drive-config.ts --apply
  */
 
@@ -127,7 +124,27 @@ const RESTORE_HOME_POSITION_INDEX = 0x2005;
 const RESTORE_HOME_POSITION_SUBINDEX = 2;
 const ASSUMED_ENCODER_RESOLUTION_BITS = 20;
 const COUNTS_PER_REVOLUTION = 2 ** ASSUMED_ENCODER_RESOLUTION_BITS;
-const HOME_OFFSET_ADJUSTMENT_DEGREES = 360;
+const STATUSWORD_INDEX = 0x6041;
+const MODES_OF_OPERATION_INDEX = 0x6060;
+const HOMING_METHOD_INDEX = 0x6098;
+const ENCODER2_ST_OFFSET_INDEX = 0x2112;
+const ENCODER2_ST_OFFSET_SUBINDEX = 6;
+const ENCODER2_FEEDBACK_INDEX = 0x2113;
+const ENCODER2_RAW_SUBINDEX = 1;
+const ENCODER2_ADJUSTED_SUBINDEX = 2;
+const ENCODER_SAMPLE_INTERVAL_MS = 100;
+const HOMING_MODE = 6;
+const HOMING_METHOD_CURRENT_POSITION = 37;
+const HOMING_TIMEOUT_MS = 10000;
+const SW_FAULT = 1 << 3;
+const SW_OPERATION_ENABLED = 1 << 2;
+const SW_HOMING_ATTAINED = 1 << 12;
+const SW_HOMING_ERROR = 1 << 13;
+const CW_SHUTDOWN = 0x06;
+const CW_SWITCH_ON = 0x07;
+const CW_ENABLE_OPERATION = 0x0f;
+const CW_START_HOMING = 0x1f;
+const CW_DISABLE_VOLTAGE = 0x00;
 const SOFTWARE_POSITION_LIMIT_INDEX = 0x607d;
 const SOFTWARE_POSITION_MIN_SUBINDEX = 1;
 const SOFTWARE_POSITION_MAX_SUBINDEX = 2;
@@ -154,15 +171,80 @@ const QUICK_STOP_SANITY_CHECK_PARAMETERS: { index: number; subindex: number; val
 const DEFAULT_CONFIG_DIR = join(__dirname, "drive_configs");
 
 program.addOption(new Option("--diagnose", "Check current polarity for all devices connected to Motion Master against their config files (read-only; does not modify any parameter)").default(false));
-program.addOption(new Option("--apply", "Stages 1-7: after diagnosing (Stage 0), ask for confirmation (1), check STO is inactive on all drives then write 0x200D:00 on mismatching devices and cycle the controlword 0 -> 6 -> 7 (2), reset home offset to zero and calculate a +360 degree polarity-inversion correction (3), then ask for confirmation again to check restore home position (0x2005:02 must be 1 on all drives), write those home offsets, and SAVE ALL PARAMETERS on those devices (4, this also persists Stage 2's polarity write), and report actual position for all devices, then confirm and write + save software position limits (0x607D:01/02) from each config file (5), then confirm and apply Quick Stop / SS1 safety configuration via the SMM (7). Implies --diagnose.").default(false));
+program.addOption(new Option("--apply", "Stages 1-7: after diagnosing (Stage 0), optionally assign names by slave position (1, with --assign-names), confirm then write 0x200D:00 from the config files on mismatching devices and cycle the controlword 0 -> 6 -> 7 (2), then set the Encoder 2 single turn offset so the encoder is in the middle of its single-turn range and home each joint there with method 37, one by one, failing loudly if the Home Offset is not 0 (3), save and report actual position (4), write + save software position limits (0x607D:01/02) from each config file (5), then apply Quick Stop / SS1 safety configuration via the SMM (7). Implies --diagnose.").default(false));
 program.addOption(new Option("--device-number <value>", "Only check the joint matching this number at 0x20F2:00, e.g. 104. If omitted, every config file is checked."));
+program.addOption(new Option("--assign-names", "Stage 1: write each drive's joint label (0x20F2:00) from the position_<NN>_*.csv files, by position in the EtherCAT chain (use --ignore_ecat_indices)").default(false));
+program.addOption(
+  new Option("--ignore_ecat_indices <list>", "Stage 1: comma-separated IgH positions of slaves that are not drives (e.g. EtherCAT switches) and have no config file, e.g. 0,3,18")
+    .default([] as number[], "none")
+    .argParser((raw: string) =>
+      raw.split(",").map((t) => t.trim()).filter((t) => t.length > 0).map((t) => {
+        const n = parseInt(t, 10);
+        if (!Number.isInteger(n) || n < 0) throw new Error(`Invalid --ignore_ecat_indices entry "${t}".`);
+        return n;
+      }),
+    ),
+);
+program.addOption(new Option("--samples <n>", "Stage 3: samples of the Encoder 2 position to read per drive (5-10)").default(10).argParser((v: string) => {
+  const n = parseInt(v, 10);
+  if (!Number.isInteger(n) || n < 5 || n > 10) throw new Error(`Invalid --samples "${v}". Expected 5-10.`);
+  return n;
+}));
+program.addOption(new Option("--resolution-bits <n>", "Stage 3: Encoder 2 single-turn resolution in bits (the middle is 2^(n-1))").default(20).argParser((v: string) => {
+  const n = parseInt(v, 10);
+  if (!Number.isInteger(n) || n < 2 || n > 31) throw new Error(`Invalid --resolution-bits "${v}".`);
+  return n;
+}));
+program.addOption(new Option("--max-spread <counts>", "Stage 3: refuse a drive whose raw Encoder 2 position varies by more than this over the samples").default(16).argParser(Number));
+program.addOption(new Option("--tolerance <counts>", "Stage 3: how far from the middle the read-back adjusted position may be").default(4).argParser(Number));
+program.addOption(new Option("--home-tolerance-deg <deg>", "Stage 3: largest |Actual position| after homing that counts as close to 0").default(0.5).argParser(Number));
+program.addOption(new Option("--pause-ms <ms>", "Stage 3: pause after announcing each joint, before it is processed").default(2000).argParser((v: string) => {
+  const n = parseInt(v, 10);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`Invalid --pause-ms "${v}".`);
+  return n;
+}));
 program.addOption(new Option("--config-dir <path>", "Directory containing the *.config.csv files").default(DEFAULT_CONFIG_DIR));
 program.addOption(new Option("-u, --username <value>", "SMM login username, used by Stage 7 (Quick Stop / SS1 configuration)").default("Test"));
 program.addOption(new Option("-p, --password <value>", "SMM login password, used by Stage 7 (Quick Stop / SS1 configuration)").default("SomanetSMM"));
 
 program.parse();
 
-const { diagnose, apply, deviceNumber, configDir, username, password, requestTimeout = 10000 } = program.opts();
+const {
+  diagnose,
+  apply,
+  deviceNumber,
+  configDir,
+  username,
+  password,
+  assignNames: assignNamesRequested,
+  ignore_ecat_indices: ignoredEcatIndices,
+  samples: encoderSamples,
+  resolutionBits,
+  maxSpread,
+  tolerance: centreTolerance,
+  homeToleranceDeg,
+  pauseMs,
+  requestTimeout = 10000,
+} = program.opts() as {
+  diagnose: boolean;
+  apply: boolean;
+  deviceNumber?: string;
+  configDir: string;
+  username: string;
+  password: string;
+  assignNames: boolean;
+  ignore_ecat_indices: number[];
+  samples: number;
+  resolutionBits: number;
+  maxSpread: number;
+  tolerance: number;
+  homeToleranceDeg: number;
+  pauseMs: number;
+  requestTimeout?: number;
+};
+
+const ENCODER2_RESOLUTION = 2 ** resolutionBits;
+const ENCODER2_HALF = ENCODER2_RESOLUTION / 2;
 
 /** Extracts the leading device number from a "<number> <joint name>" label, e.g. "104 head_yaw" -> "104". */
 function extractDeviceNumber(label: string): string | undefined {
@@ -196,11 +278,6 @@ function logStage(stage: number, title: string): void {
 /** Converts a raw encoder count (0x6064:00 / 0x607C:00 units) to degrees, assuming ASSUMED_ENCODER_RESOLUTION_BITS. */
 function countsToDegrees(counts: number): number {
   return (counts / COUNTS_PER_REVOLUTION) * 360;
-}
-
-/** Converts a degree value to raw encoder counts, assuming ASSUMED_ENCODER_RESOLUTION_BITS. */
-function degreesToCounts(degrees: number): number {
-  return Math.round((degrees / 360) * COUNTS_PER_REVOLUTION);
 }
 
 interface SourceConfig {
@@ -344,13 +421,255 @@ async function checkStoInactiveOnAllDrives(eligible: Row[]): Promise<void> {
   }
 }
 
+/** Reads a numeric object from a live device. */
+const readObject = (d: LiveDevice, index: number, subindex: number) =>
+  client.request.upload<number>(d.deviceRef, index, subindex, false, requestTimeout);
+
+/** Writes a numeric object to a live device (a plain SDO download). */
+const writeObject = (d: LiveDevice, index: number, subindex: number, value: number) =>
+  client.request.download(d.deviceRef, index, subindex, value, undefined, requestTimeout);
+
+/** Prints a block of `!` around the given lines, for warnings that must not be missed. */
+function banner(lines: string[]): void {
+  const inner = Math.max(...lines.map((l) => l.length)) + 4;
+  const bar = "!".repeat(inner + 4);
+  const blank = `!!${" ".repeat(inner)}!!`;
+  const body = lines.map((l) => `!!  ${l.padEnd(inner - 2)}!!`);
+  console.warn(`\n${[bar, bar, blank, ...body, blank, bar, bar].join("\n")}\n`);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 1: assign names by slave position
+// ---------------------------------------------------------------------------------------------
+
+interface NameSource {
+  /** The IgH position from the filename (`position_<NN>_...`). */
+  filePosition: number;
+  fileName: string;
+  /** The "<number> <joint name>" string from the file's 0x20F2:00 row. */
+  label: string;
+}
+
+/** Reads every `position_NN_*.csv` in `dir` and returns the label each one carries, by file position. */
+function scanNameSources(dir: string): { sources: Map<number, NameSource>; problems: string[] } {
+  const sources = new Map<number, NameSource>();
+  const problems: string[] = [];
+
+  for (const fileName of readdirSync(dir).filter((n) => n.endsWith(".csv")).sort()) {
+    const match = fileName.match(/^position_(\d+)[_-]/i);
+    if (!match) {
+      problems.push(`${fileName}: filename does not start with "position_<NN>_", ignored`);
+      continue;
+    }
+    const position = parseInt(match[1], 10);
+
+    const configFile = new ConfigFile(readFileSync(join(dir, fileName), "utf-8"));
+    const labelParam = configFile.parameters.find(
+      (p) => p.index === DEVICE_LABEL_INDEX && p.subindex === DEVICE_LABEL_SUBINDEX,
+    );
+    const label = labelParam ? String(labelParam.value).trim() : "";
+    if (!extractDeviceNumber(label)) {
+      problems.push(`${fileName}: no usable 0x20F2:00 label ("<number> <joint name>") in the file, ignored`);
+      continue;
+    }
+
+    const existing = sources.get(position);
+    if (existing) {
+      problems.push(`file position ${position}: claimed by both ${existing.fileName} and ${fileName}`);
+      continue;
+    }
+    sources.set(position, { filePosition: position, fileName, label });
+  }
+
+  return { sources, problems };
+}
+
+/** The IgH position of a file -> the 0-based index of its drive in bus order, with the ignored positions taken out. */
+function driveIndexOf(igHPosition: number): number {
+  return igHPosition - ignoredEcatIndices.filter((s) => s < igHPosition).length;
+}
+
 /**
- * Prompts for confirmation, then processes every row with a resolved polarity comparison
- * (status MATCH or MISMATCH):
+ * Stage 1 (--apply with --assign-names): writes each drive's joint label (0x20F2:00) from the
+ * config files, by position in the EtherCAT chain, so a robot whose drives were never labelled
+ * can be named in the same run. Returns true when at least one label was written, so the caller
+ * re-runs the Stage 0 pairing.
+ *
+ * The files are generated with the IgH master, which counts from 0 and counts every slave on the
+ * bus, including those that are not drives (e.g. Beckhoff EtherCAT switches). Motion Master here
+ * runs SOEM, which only reports the drives. --ignore_ecat_indices lists the IgH positions of the
+ * slaves that are not drives; the file position is converted to a drive index by taking out the
+ * ignored positions that come before it (with 0,3,18: position_01 -> 1st drive, position_04 -> 3rd,
+ * position_19 -> 17th). Devices are sorted by position, so SOEM's 1-based and IgH's 0-based
+ * numbering make no difference. Only correct when the cabling is monotonic.
+ */
+async function assignNames(): Promise<boolean> {
+  logStage(1, "Assign names by slave position");
+
+  if (!assignNamesRequested) {
+    console.log("Skipped — pass --assign-names (with --ignore_ecat_indices) to write the joint labels from the config files.\n");
+    return false;
+  }
+
+  banner([
+    "Applying this step assumes EtherCAT network is wired exactly same between the robots",
+    ignoredEcatIndices.length > 0
+      ? `Assuming monotonic cabling and position ${ignoredEcatIndices.join(", ")} as EtherCAT switch positions`
+      : "Assuming monotonic cabling and no ignored EtherCAT positions (see --ignore_ecat_indices)",
+  ]);
+
+  const { sources, problems } = scanNameSources(configDir);
+  console.log(`Found ${sources.size} config file(s) with a position and a label.`);
+  for (const p of problems) console.warn(`  [WARN] ${p}`);
+  if (sources.size === 0) throw new Error(`No usable position_<NN>_*.csv files in ${configDir}.`);
+
+  const devices = await lastValueFrom(client.request.getDevices(requestTimeout));
+  const byBusOrder = [...devices].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+  console.log(`Discovered ${byBusOrder.length} drive(s) on the network.\n`);
+  if (byBusOrder.length !== sources.size) {
+    console.warn(
+      `[WARN] The network has ${byBusOrder.length} drive(s) but there are ${sources.size} config file(s). ` +
+        `The robot is probably not the one the files came from.\n`,
+    );
+  }
+
+  interface NameRow {
+    filePosition: number;
+    driveNumber?: number;
+    deviceRef?: string | number;
+    deviceAddress?: number;
+    currentLabel: string;
+    newLabel: string;
+    fileName: string;
+    skip?: string;
+  }
+
+  const rows: NameRow[] = [];
+  for (const source of [...sources.values()].sort((a, b) => a.filePosition - b.filePosition)) {
+    if (deviceNumber && extractDeviceNumber(source.label) !== deviceNumber) continue;
+
+    if (ignoredEcatIndices.includes(source.filePosition)) {
+      rows.push({ filePosition: source.filePosition, currentLabel: "-", newLabel: source.label, fileName: source.fileName, skip: "FILE AT AN IGNORED POSITION" });
+      continue;
+    }
+
+    const driveIndex = driveIndexOf(source.filePosition);
+    const device = byBusOrder[driveIndex];
+    if (!device) {
+      rows.push({ filePosition: source.filePosition, driveNumber: driveIndex + 1, currentLabel: "-", newLabel: source.label, fileName: source.fileName, skip: "NO DRIVE AT THIS POSITION" });
+      continue;
+    }
+
+    const deviceRef = device.serialNumber ?? device.deviceAddress;
+    let currentLabel = "(unreadable)";
+    try {
+      currentLabel = String(
+        await client.request.upload<string>(deviceRef, DEVICE_LABEL_INDEX, DEVICE_LABEL_SUBINDEX, false, requestTimeout),
+      );
+    } catch {
+      // A drive that was never labelled — the write below decides.
+    }
+    rows.push({
+      filePosition: source.filePosition,
+      driveNumber: driveIndex + 1,
+      deviceRef,
+      deviceAddress: device.deviceAddress,
+      currentLabel,
+      newLabel: source.label,
+      fileName: source.fileName,
+    });
+  }
+  if (rows.length === 0) throw new Error(`No config file matches --device-number ${deviceNumber}.`);
+
+  // Two files with the same joint number would make every later step ambiguous.
+  const seen = new Map<string, NameRow>();
+  for (const row of rows) {
+    const key = extractDeviceNumber(row.newLabel) ?? row.newLabel;
+    const other = seen.get(key);
+    if (other) row.skip = row.skip ?? `DUPLICATE JOINT NUMBER (also file position ${other.filePosition})`;
+    else seen.set(key, row);
+  }
+
+  console.table(
+    rows.map((r) => ({
+      "File position (IgH)": r.filePosition,
+      "Drive # (SOEM)": r.driveNumber ?? "-",
+      "Device address": r.deviceAddress !== undefined ? `0x${r.deviceAddress.toString(16).toUpperCase()}` : "-",
+      "Current label": r.currentLabel,
+      "New label": r.newLabel,
+      File: r.fileName,
+      Status: r.skip ?? (r.currentLabel === r.newLabel ? "ALREADY SET" : "PENDING"),
+    })),
+  );
+
+  const mapped = new Set(rows.map((r) => r.driveNumber).filter((n): n is number => n !== undefined));
+  const untouched = byBusOrder.map((_, i) => i + 1).filter((n) => !mapped.has(n));
+  if (!deviceNumber && untouched.length > 0) {
+    console.log(`Drive(s) with no config file, left untouched: ${untouched.join(", ")}\n`);
+  }
+
+  const problemsInTable = rows.filter((r) => r.skip);
+  const toWrite = rows.filter((r) => !r.skip && r.currentLabel !== r.newLabel);
+  if (toWrite.length === 0) {
+    console.log("No label needs to be written.\n");
+    if (problemsInTable.length > 0) throw new Error(`${problemsInTable.length} config file(s) could not be paired with a drive (see the table).`);
+    return false;
+  }
+
+  banner([
+    "Applying this step assumes EtherCAT network is wired exactly same between the robots",
+    ignoredEcatIndices.length > 0
+      ? `Assuming monotonic cabling and position ${ignoredEcatIndices.join(", ")} as EtherCAT switch positions`
+      : "Assuming monotonic cabling and no ignored EtherCAT positions (see --ignore_ecat_indices)",
+  ]);
+  console.log(
+    `${toWrite.length} label(s) will be written to 0x20F2:00 and saved (0x1010: Store parameters) on the drive\n` +
+      `at each position above. Check the table: a drive at the wrong position gets the wrong name.\n`,
+  );
+  if (!(await confirm(`Type "yes" to assign these ${toWrite.length} name(s), anything else to abort: `))) {
+    throw new Error("Aborted at Stage 1 — no names assigned, and the later stages need them.");
+  }
+
+  const results: { "File position (IgH)": number; "New label": string; Status: string }[] = [];
+  for (const row of toWrite) {
+    const result = (Status: string) => results.push({ "File position (IgH)": row.filePosition, "New label": row.newLabel, Status });
+    try {
+      await client.request.download(row.deviceRef!, DEVICE_LABEL_INDEX, DEVICE_LABEL_SUBINDEX, row.newLabel, "stringValue", requestTimeout);
+      const readBack = String(
+        await client.request.upload<string>(row.deviceRef!, DEVICE_LABEL_INDEX, DEVICE_LABEL_SUBINDEX, false, requestTimeout),
+      );
+      if (readBack !== row.newLabel) {
+        result(`VERIFY FAILED (read back "${readBack}")`);
+        continue;
+      }
+      try {
+        await lastValueFrom(client.request.saveConfig(row.deviceRef!));
+        result("ASSIGNED & SAVED");
+      } catch (err: any) {
+        result(`ASSIGNED, SAVE FAILED (${err?.message ?? err})`);
+      }
+    } catch (err: any) {
+      result(`WRITE FAILED (${err?.message ?? err})`);
+    }
+  }
+
+  console.log("\n=== Assign names summary ===");
+  console.table(results);
+  const failed = results.filter((r) => r.Status !== "ASSIGNED & SAVED");
+  if (failed.length > 0) throw new Error(`${failed.length} name(s) were not assigned and saved — see the table.`);
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 2: polarity from the config files
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Stage 2: prompts for confirmation, then processes every row with a resolved polarity
+ * comparison (status MATCH or MISMATCH):
  *   - MISMATCH: writes 0x200D:00 to match the config file (a plain SDO download to the
- *     device's live parameter set — NEVER saved/persisted, no 0x1010 store parameters, so it
- *     only lasts until the next power cycle or config reload), verifies it, then cycles the
- *     controlword.
+ *     device's live parameter set), verifies it, then cycles the controlword. The write is saved
+ *     in Stage 3 together with the Encoder 2 single turn offset.
  *   - MATCH: nothing is written; the controlword is still cycled.
  * In both cases the controlword (0x6040:00) is cycled through 0 -> 6 -> 7 (clear -> Shutdown
  * -> Switch On) — but only after confirming STO is inactive on every device (see
@@ -364,7 +683,7 @@ async function applyPolarity(rows: Row[]): Promise<void> {
     return;
   }
 
-  logStage(1, "Confirm applying polarity changes");
+  logStage(2, "Apply system polarity from the config files");
 
   const mismatchCount = eligible.filter((r) => r.status === "MISMATCH").length;
   console.log(
@@ -382,8 +701,8 @@ async function applyPolarity(rows: Row[]): Promise<void> {
     })),
   );
   console.log(
-    "\nMismatching devices get 0x200D:00 written directly to their live parameter set only — NOT saved/persisted.\n" +
-      "Every listed device then has its controlword (0x6040:00) cycled 0 -> 6 -> 7.\n",
+    "\nMismatching devices get 0x200D:00 written to their live parameter set; it is saved in Stage 3 with the\n" +
+      "Encoder 2 single turn offset. Every listed device then has its controlword (0x6040:00) cycled 0 -> 6 -> 7.\n",
   );
 
   const confirmed = await confirm(`Type "yes" to proceed on these ${eligible.length} device(s), anything else to abort: `);
@@ -391,8 +710,6 @@ async function applyPolarity(rows: Row[]): Promise<void> {
     console.log("\nAborted — no changes applied.\n");
     return;
   }
-
-  logStage(2, "Apply polarity changes and controlword transition");
 
   await checkStoInactiveOnAllDrives(eligible);
 
@@ -428,252 +745,374 @@ async function applyPolarity(rows: Row[]): Promise<void> {
 
   console.log("=== Apply summary ===");
   console.table(results);
-  console.log("Reminder: polarity writes were NOT saved — they apply only until the next power cycle or config reload.\n");
 
   const stage2StatusByDevice = new Map(results.map((r) => [r.Device, r.Status]));
-  const pendingHomeOffsetAdjustments = await resetHomeOffsetAndCalculateInversionCorrection(eligible, stage2StatusByDevice);
-  await applyHomeOffsetsAndReportPosition(eligible, pendingHomeOffsetAdjustments);
+  const homed = await centreEncodersAndHome(eligible, stage2StatusByDevice);
+  if (!homed) return;
+  await saveAndReportPositions(homed);
   await applySoftwarePositionLimits(eligible);
   await applyQuickStopAndSs1Configuration(eligible);
 }
 
-interface PendingHomeOffsetAdjustment {
-  row: Row;
-  positionDegrees: number;
-  newHomeOffsetCounts: number;
+// ---------------------------------------------------------------------------------------------
+// Stage 3: Encoder 2 single turn offset, then homing
+// ---------------------------------------------------------------------------------------------
+
+/** Wraps `n` into [0, ENCODER2_RESOLUTION). */
+const wrapEncoder = (n: number) => ((n % ENCODER2_RESOLUTION) + ENCODER2_RESOLUTION) % ENCODER2_RESOLUTION;
+
+/** Shortest signed distance from b to a on the circle of ENCODER2_RESOLUTION counts. */
+function circularDiff(a: number, b: number): number {
+  const d = wrapEncoder(a - b);
+  return d > ENCODER2_HALF ? d - ENCODER2_RESOLUTION : d;
+}
+
+/** The single turn offset that puts the raw position in the middle of the range. */
+function calculateSingleTurnOffset(raw: number): number {
+  return raw < ENCODER2_HALF ? raw + ENCODER2_HALF : raw - ENCODER2_HALF;
 }
 
 /**
- * Stage 3: ONLY for devices whose polarity did NOT match their config file (status MISMATCH)
- * and that completed Stage 2 (status APPLIED) — MATCH devices are left alone entirely, since
- * their polarity was already correct and nothing was written to them.
- *
- * Inverting system polarity at a non-zero angle adds a full revolution to the Actual position
- * value: e.g. at +90°, inverting polarity moves it to -(360+90) = -450° (not just -90°); at
- * -90°, it moves to -(360-90) = -270° (not +90°). In both cases the fix is the same: add +360°
- * worth of counts to the home offset. For that correction to be exact and independent of
- * whatever was on the device before, this stage first CHECKS the device's current home offset
- * (0x607C:00) and, if it isn't already 0, WRITES it to 0 and verifies the readback — the only
- * write this stage makes. It then reads the Actual position value (0x6064:00) purely for the
- * printed table (the correction itself no longer depends on that value) and CALCULATES the
- * pending home offset as +360 degrees worth of counts (assuming a 20-bit position encoder).
- * Nothing else is written here; Stage 4 applies the calculated home offset. Prints a summary
- * table of the outcome and returns the pending adjustments for Stage 4.
+ * Mean of samples on the circle, so a joint sitting on the 0 / resolution seam does not average
+ * to the middle of the range; also returns the largest distance from the mean.
  */
-async function resetHomeOffsetAndCalculateInversionCorrection(
-  eligible: Row[],
-  stage2StatusByDevice: Map<string, string>,
-): Promise<PendingHomeOffsetAdjustment[]> {
-  logStage(3, "Reset home offset and calculate polarity-inversion correction");
+function circularMean(values: number[]): { mean: number; spread: number } {
+  const reference = values[0];
+  const meanDiff = values.reduce((sum, v) => sum + circularDiff(v, reference), 0) / values.length;
+  const mean = wrapEncoder(Math.round(reference + meanDiff));
+  const spread = Math.max(...values.map((v) => Math.abs(circularDiff(v, mean))));
+  return { mean, spread };
+}
 
-  const mismatched = eligible.filter((r) => r.status === "MISMATCH");
-  if (mismatched.length === 0) {
-    console.log("No devices had a polarity mismatch — nothing to check for Stage 3.\n");
-    return [];
+async function readEncoderSamples(d: LiveDevice, count: number) {
+  const raw: number[] = [];
+  const adjusted: number[] = [];
+  for (let i = 0; i < count; i++) {
+    raw.push(await readObject(d, ENCODER2_FEEDBACK_INDEX, ENCODER2_RAW_SUBINDEX));
+    adjusted.push(await readObject(d, ENCODER2_FEEDBACK_INDEX, ENCODER2_ADJUSTED_SUBINDEX));
+    if (i < count - 1) await resolveAfter(ENCODER_SAMPLE_INTERVAL_MS);
+  }
+  return { raw: circularMean(raw), adjusted: circularMean(adjusted) };
+}
+
+interface CentrePlan {
+  row: Row;
+  device: LiveDevice;
+  raw: number;
+  adjustedBefore: number;
+  currentOffset: number;
+  restoreHomeBefore: number;
+  homeOffsetBefore: number;
+  newOffset: number;
+  skip?: string;
+}
+
+async function planCentering(row: Row, stage2Status: string | undefined): Promise<CentrePlan> {
+  const device = row.liveDevice!;
+  const blank = { row, device, raw: NaN, adjustedBefore: NaN, currentOffset: NaN, restoreHomeBefore: NaN, homeOffsetBefore: NaN, newOffset: NaN };
+  if (stage2Status !== "APPLIED" && stage2Status !== "TRANSITIONED") {
+    return { ...blank, skip: `STAGE 2 DID NOT COMPLETE (${stage2Status ?? "no result"})` };
+  }
+  try {
+    const statusword = await readObject(device, STATUSWORD_INDEX, 0);
+    if (statusword & SW_OPERATION_ENABLED) return { ...blank, skip: "OPERATION ENABLED (drive is holding the joint)" };
+    if (statusword & SW_FAULT) return { ...blank, skip: `FAULT (statusword 0x${statusword.toString(16)})` };
+
+    const currentOffset = await readObject(device, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX);
+    const restoreHomeBefore = await readObject(device, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX);
+    const homeOffsetBefore = await readObject(device, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX);
+    const { raw, adjusted } = await readEncoderSamples(device, encoderSamples);
+    if (raw.spread > maxSpread) {
+      return { ...blank, currentOffset, restoreHomeBefore, homeOffsetBefore, skip: `JOINT MOVING (raw spread ${raw.spread} > ${maxSpread})` };
+    }
+    return {
+      row,
+      device,
+      raw: raw.mean,
+      adjustedBefore: adjusted.mean,
+      currentOffset,
+      restoreHomeBefore,
+      homeOffsetBefore,
+      newOffset: calculateSingleTurnOffset(raw.mean),
+    };
+  } catch (err: any) {
+    return { ...blank, skip: `READ FAILED (${err?.message ?? err})` };
+  }
+}
+
+/**
+ * Writes the Encoder 2 single turn offset and Restore home position = 1, saves, and reads the
+ * adjusted position back; it must be the middle of the range within --tolerance counts. On any
+ * other result the previous offset and restore flag are written back and saved.
+ */
+async function applyCentering(p: CentrePlan): Promise<{ ok: boolean; status: string }> {
+  const d = p.device;
+  try {
+    await writeObject(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, p.newOffset);
+    await writeObject(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, 1);
+    await lastValueFrom(client.request.saveConfig(d.deviceRef));
+  } catch (err: any) {
+    return { ok: false, status: `ST OFFSET WRITE/SAVE FAILED (${err?.message ?? err}) — check the drive` };
+  }
+
+  try {
+    const { adjusted } = await readEncoderSamples(d, 5);
+    const error = circularDiff(adjusted.mean, ENCODER2_HALF);
+    if (Math.abs(error) <= centreTolerance && adjusted.spread <= maxSpread) {
+      return { ok: true, status: `ST OFFSET SET (adjusted position ${adjusted.mean}, ${error >= 0 ? "+" : ""}${error} from the middle)` };
+    }
+    try {
+      await writeObject(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, p.currentOffset);
+      await writeObject(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, p.restoreHomeBefore);
+      await lastValueFrom(client.request.saveConfig(d.deviceRef));
+      return { ok: false, status: `ST OFFSET FAILED, ROLLED BACK (adjusted position ${adjusted.mean}, ${error} from the middle)` };
+    } catch (err: any) {
+      return {
+        ok: false,
+        status: `ST OFFSET FAILED AND ROLLBACK FAILED (${err?.message ?? err}) — restore 0x2112:06=${p.currentOffset}, 0x2005:02=${p.restoreHomeBefore} manually`,
+      };
+    }
+  } catch (err: any) {
+    return { ok: false, status: `ST OFFSET VERIFY FAILED (${err?.message ?? err})` };
+  }
+}
+
+/** Fails loudly when the Home Offset object (0x607C:00) is not 0. */
+function homeOffsetFailure(label: string, homeOffset: number, when: string): string {
+  const message = `HOME OFFSET (0x607C:00) IS ${homeOffset} ${when}, IT MUST BE 0`;
+  banner([`${label}: ${message}`, "The joint must be homed with a zero Home Offset - do not use this robot until this is resolved"]);
+  return message;
+}
+
+/**
+ * Homing method 37 (current position) on one drive: Modes of operation 6, Homing method
+ * (0x6098:00) 37, controlword 6 -> 7 -> 15, then 31 to start homing and wait for Homing attained.
+ * Afterwards the Home Offset (0x607C:00) must still be 0 and the Actual position close to 0.
+ * The drive is always returned to Switched on disabled with its previous mode of operation.
+ */
+async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok: boolean; status: string }> {
+  let previousMode: number | undefined;
+  try {
+    previousMode = await readObject(d, MODES_OF_OPERATION_INDEX, 0);
+
+    await writeObject(d, MODES_OF_OPERATION_INDEX, 0, HOMING_MODE);
+    await writeObject(d, HOMING_METHOD_INDEX, 0, HOMING_METHOD_CURRENT_POSITION);
+
+    for (const controlword of [CW_SHUTDOWN, CW_SWITCH_ON, CW_ENABLE_OPERATION]) {
+      await writeObject(d, CONTROLWORD_INDEX, CONTROLWORD_SUBINDEX, controlword);
+      await resolveAfter(CONTROLWORD_STEP_DELAY_MS);
+    }
+    const afterEnable = await readObject(d, STATUSWORD_INDEX, 0);
+    if (afterEnable & SW_FAULT || !(afterEnable & SW_OPERATION_ENABLED)) {
+      return { ok: false, status: `HOMING NOT STARTED (statusword 0x${afterEnable.toString(16)}: not operation enabled)` };
+    }
+
+    await writeObject(d, CONTROLWORD_INDEX, CONTROLWORD_SUBINDEX, CW_START_HOMING);
+    const deadline = Date.now() + HOMING_TIMEOUT_MS;
+    let statusword = 0;
+    while (Date.now() < deadline) {
+      statusword = await readObject(d, STATUSWORD_INDEX, 0);
+      if (statusword & (SW_HOMING_ATTAINED | SW_HOMING_ERROR | SW_FAULT)) break;
+      await resolveAfter(50);
+    }
+    if (statusword & (SW_HOMING_ERROR | SW_FAULT)) return { ok: false, status: `HOMING ERROR (statusword 0x${statusword.toString(16)})` };
+    if (!(statusword & SW_HOMING_ATTAINED)) return { ok: false, status: `HOMING TIMEOUT (statusword 0x${statusword.toString(16)})` };
+
+    const homeOffset = await readObject(d, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX);
+    if (homeOffset !== 0) return { ok: false, status: homeOffsetFailure(label, homeOffset, "AFTER HOMING") };
+
+    const degrees = countsToDegrees(await readObject(d, POSITION_ACTUAL_INDEX, POSITION_ACTUAL_SUBINDEX));
+    const close = Math.abs(degrees) <= homeToleranceDeg;
+    return {
+      ok: close,
+      status: `${close ? "HOMED" : "HOMED, POSITION NOT NEAR 0"} (actual position ${degrees.toFixed(3)}°, home offset 0)`,
+    };
+  } catch (err: any) {
+    return { ok: false, status: `HOMING FAILED (${err?.message ?? err})` };
+  } finally {
+    try {
+      await writeObject(d, CONTROLWORD_INDEX, CONTROLWORD_SUBINDEX, CW_DISABLE_VOLTAGE);
+      if (previousMode !== undefined) await writeObject(d, MODES_OF_OPERATION_INDEX, 0, previousMode);
+    } catch {
+      console.error(`  [ERROR] could not return ${label} to Switched on disabled — check the drive.`);
+    }
+  }
+}
+
+/**
+ * Stage 3: for every joint that completed Stage 2, centres the Encoder 2 single turn range and
+ * homes the joint there, one joint after the other:
+ *
+ *   1. Read --samples (5-10) samples of Encoder 2 feedback Raw (0x2113:01) and Adjusted
+ *      (0x2113:02) position per drive (refusing a drive that is moving or operation enabled),
+ *      calculate the single turn offset (IF raw < resolution/2 THEN raw + 2^19 ELSE raw - 2^19)
+ *      and print the table, including the adjusted position expected afterwards (2^19).
+ *   2. After confirmation, per joint: print its assigned name and pause; make sure the Home Offset
+ *      (0x607C:00) is 0 (a non-zero value is reset and reported); write the single turn offset
+ *      (0x2112:06) and Restore home position (0x2005:02) = 1, save, and read 0x2113:02 back — it
+ *      must be 2^19; then Homing method 37 at the current position.
+ *   3. At the end of the homing the Home Offset must still be 0, otherwise the run fails loudly.
+ *
+ * Stops at the first joint that fails and throws once the summary is printed, so the later stages
+ * never run on a half-commissioned robot. Returns the homed rows, or undefined when aborted.
+ */
+async function centreEncodersAndHome(eligible: Row[], stage2StatusByDevice: Map<string, string>): Promise<Row[] | undefined> {
+  logStage(3, "Set Encoder 2 single turn offset and home at the middle of the range");
+
+  console.log(
+    `Every joint must be at its home position (mechanical zero, or the zero you want) before this stage.\n` +
+      `Reading ${encoderSamples} sample(s) of the Encoder 2 position from ${eligible.length} drive(s)...\n`,
+  );
+  const plans: CentrePlan[] = [];
+  for (const row of eligible) plans.push(await planCentering(row, stage2StatusByDevice.get(row.deviceNumber)));
+
+  const show = (n: number) => (Number.isNaN(n) ? "-" : n);
+  console.table(
+    plans.map((p) => ({
+      Device: p.row.deviceNumber,
+      Joint: p.row.label,
+      "Adjusted before (0x2113:02)": show(p.adjustedBefore),
+      "Raw (0x2113:01)": show(p.raw),
+      "ST offset now (0x2112:06)": show(p.currentOffset),
+      "Calculated ST offset": show(p.newOffset),
+      "Expected adjusted after": Number.isNaN(p.newOffset) ? "-" : wrapEncoder(p.raw - p.newOffset),
+      "Home offset now (0x607C:00)": show(p.homeOffsetBefore),
+      Status: p.skip ?? "READY",
+    })),
+  );
+  for (const p of plans) {
+    if (p.skip) continue;
+    const expected = wrapEncoder(p.raw - p.currentOffset);
+    if (Math.abs(circularDiff(expected, p.adjustedBefore)) > Math.max(centreTolerance, maxSpread)) {
+      console.warn(
+        `[WARN] ${p.row.label}: adjusted position ${p.adjustedBefore} is not raw - offset (${expected}). ` +
+          `The result is verified after writing and rolled back if it is not ${ENCODER2_HALF}.`,
+      );
+    }
+    if (p.homeOffsetBefore !== 0) {
+      console.warn(`[WARN] ${p.row.label}: Home Offset (0x607C:00) is ${p.homeOffsetBefore}, not 0 — it will be reset to 0 before homing.`);
+    }
+  }
+
+  const skipped = plans.filter((p) => p.skip);
+  if (skipped.length > 0) {
+    throw new Error(
+      `${skipped.length} joint(s) cannot go through Stage 3: ${skipped.map((p) => `${p.row.label} [${p.skip}]`).join("; ")}. ` +
+        `Resolve this and re-run — homing only some of the joints would leave the robot half-commissioned.`,
+    );
+  }
+
+  banner([
+    `Stage 3 will ENERGIZE ${plans.length} drive(s), one after the other: Operation enabled, Homing mode`,
+    `It saves 0x2112:06 so the Encoder 2 position reads ${ENCODER2_HALF}, then homes with method 37 where the joint is now`,
+    "Method 37 is not meant to move the joint - keep clear and keep the approved E-stop/STO within reach",
+  ]);
+  if (!(await confirm(`Type "yes" to set the offset, save and home these ${plans.length} joint(s) one by one, anything else to abort: `))) {
+    console.log("\nAborted — nothing written in Stage 3.\n");
+    return undefined;
+  }
+
+  const results: { Order: number; Device: string; Joint: string; Status: string }[] = [];
+  const homed: Row[] = [];
+  let failure: string | undefined;
+
+  for (const [i, p] of plans.entries()) {
+    const record = (Status: string) => results.push({ Order: i + 1, Device: p.row.deviceNumber, Joint: p.row.label, Status });
+
+    console.log(`\n>>> [${i + 1}/${plans.length}] ${p.row.label} <<<`);
+    await resolveAfter(pauseMs);
+
+    try {
+      // The Home Offset must be 0 before homing: reset a leftover value (e.g. from a loaded config).
+      if (p.homeOffsetBefore !== 0) {
+        await writeObject(p.device, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX, 0);
+        const verified = await readObject(p.device, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX);
+        if (verified !== 0) {
+          record(`HOME OFFSET RESET FAILED (read back ${verified})`);
+          failure = homeOffsetFailure(p.row.label, verified, "AFTER A RESET");
+          break;
+        }
+      }
+
+      const centred = await applyCentering(p);
+      console.log(`    ${centred.status}`);
+      if (!centred.ok) {
+        record(centred.status);
+        failure = `${p.row.label}: ${centred.status}`;
+        break;
+      }
+
+      const homing = await homeAtCurrentPosition(p.device, p.row.label);
+      console.log(`    ${homing.status}`);
+      record(`${centred.status}; ${homing.status}`);
+      if (!homing.ok) {
+        failure = `${p.row.label}: ${homing.status}`;
+        break;
+      }
+      homed.push(p.row);
+    } catch (err: any) {
+      record(`FAILED (${err?.message ?? err})`);
+      failure = `${p.row.label}: ${err?.message ?? err}`;
+      break;
+    }
+  }
+
+  console.log("\n=== Stage 3 summary ===");
+  console.table(results);
+  if (failure) {
+    throw new Error(
+      `Stage 3 failed at ${failure}. ${plans.length - results.length} joint(s) were not processed; nothing after Stage 3 was run.`,
+    );
+  }
+  return homed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 4: save and report
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Stage 4: asks for confirmation, then SAVES all parameters on every homed device (0x1010: Store
+ * parameters) so the homed position (Restore home position = 1) and everything written in Stages
+ * 2 and 3 persist across a power cycle, and reports each device's Actual position (0x6064:00) and
+ * Home Offset (0x607C:00). A Home Offset that is not 0 fails loudly.
+ */
+async function saveAndReportPositions(homed: Row[]): Promise<void> {
+  logStage(4, "Save parameters and report actual position");
+
+  if (homed.length === 0) {
+    console.log("No homed devices — nothing to save.\n");
+    return;
   }
 
   console.log(
-    `[INFO] Inverting system polarity at a non-zero angle adds a full revolution to the Actual\n` +
-      `position value, in either direction. Every inverted device's home offset (0x607C:00) is\n` +
-      `first reset to 0 (if not already), then corrected by +${HOME_OFFSET_ADJUSTMENT_DEGREES}° worth of counts ` +
-      `(assuming a ${ASSUMED_ENCODER_RESOLUTION_BITS}-bit position encoder, ${COUNTS_PER_REVOLUTION} counts/revolution).\n`,
+    `ALL parameters on ${homed.length} homed device(s) will be SAVED (0x1010: Store parameters), so the homed position,\n` +
+      `the Encoder 2 single turn offset and the polarity persist across a power cycle.\n`,
   );
+  const confirmed = await confirm(`Type "yes" to save these ${homed.length} device(s), anything else to skip: `);
 
-  const pending: PendingHomeOffsetAdjustment[] = [];
-  const results: { Device: string; Joint: string; "Home Offset Before (deg)": string; "Position (deg)": string; Status: string }[] = [];
-
-  for (const row of mismatched) {
-    const stage2Status = stage2StatusByDevice.get(row.deviceNumber);
-    if (stage2Status !== "APPLIED") {
-      results.push({ Device: row.deviceNumber, Joint: row.label, "Home Offset Before (deg)": "-", "Position (deg)": "-", Status: "SKIPPED (stage 2 did not complete)" });
-      continue;
-    }
-
-    const liveDevice = row.liveDevice!;
+  const results: { Device: string; Joint: string; "Position (deg)": string; "Home Offset": number | string; Status: string }[] = [];
+  let failure: string | undefined;
+  for (const row of homed) {
+    const d = row.liveDevice!;
+    let status = confirmed ? "SAVED" : "NOT SAVED";
     try {
-      const currentHomeOffsetCounts = await client.request.upload<number>(
-        liveDevice.deviceRef,
-        HOME_OFFSET_INDEX,
-        HOME_OFFSET_SUBINDEX,
-        false,
-        requestTimeout,
-      );
-
-      if (currentHomeOffsetCounts !== 0) {
-        await client.request.download(liveDevice.deviceRef, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX, 0, undefined, requestTimeout);
-        const verifiedZero = await client.request.upload<number>(liveDevice.deviceRef, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX, false, requestTimeout);
-        if (verifiedZero !== 0) {
-          results.push({
-            Device: row.deviceNumber,
-            Joint: row.label,
-            "Home Offset Before (deg)": countsToDegrees(currentHomeOffsetCounts).toFixed(2),
-            "Position (deg)": "-",
-            Status: `RESET TO ZERO FAILED (read back ${verifiedZero})`,
-          });
-          continue;
-        }
+      if (confirmed) await lastValueFrom(client.request.saveConfig(d.deviceRef));
+      const degrees = countsToDegrees(await readObject(d, POSITION_ACTUAL_INDEX, POSITION_ACTUAL_SUBINDEX));
+      const homeOffset = await readObject(d, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX);
+      if (homeOffset !== 0) {
+        status = homeOffsetFailure(row.label, homeOffset, "AFTER HOMING AND SAVING");
+        failure = failure ?? `${row.label}: ${status}`;
       }
-
-      const positionCounts = await client.request.upload<number>(
-        liveDevice.deviceRef,
-        POSITION_ACTUAL_INDEX,
-        POSITION_ACTUAL_SUBINDEX,
-        false,
-        requestTimeout,
-      );
-      const positionDegrees = countsToDegrees(positionCounts);
-      const newHomeOffsetCounts = degreesToCounts(HOME_OFFSET_ADJUSTMENT_DEGREES);
-
-      pending.push({ row, positionDegrees, newHomeOffsetCounts });
-      results.push({
-        Device: row.deviceNumber,
-        Joint: row.label,
-        "Home Offset Before (deg)": countsToDegrees(currentHomeOffsetCounts).toFixed(2),
-        "Position (deg)": positionDegrees.toFixed(2),
-        Status: `RESET TO 0, +${HOME_OFFSET_ADJUSTMENT_DEGREES}° PENDING IN STAGE 4`,
-      });
+      results.push({ Device: row.deviceNumber, Joint: row.label, "Position (deg)": degrees.toFixed(3), "Home Offset": homeOffset, Status: status });
     } catch (err: any) {
-      results.push({ Device: row.deviceNumber, Joint: row.label, "Home Offset Before (deg)": "-", "Position (deg)": "-", Status: `FAILED (${err?.message ?? err})` });
+      status = `FAILED (${err?.message ?? err})`;
+      failure = failure ?? `${row.label}: ${status}`;
+      results.push({ Device: row.deviceNumber, Joint: row.label, "Position (deg)": "-", "Home Offset": "-", Status: status });
     }
   }
-
   console.table(results);
-  return pending;
-}
-
-/**
- * Checks whether the restore home position object (0x2005:02) reads 1 on every device that went
- * through Stage 2 (both MATCH and MISMATCH) — a precondition Stage 4 requires before it will
- * save anything. Prints a table of the result. Returns true only if every device reads back
- * exactly 1; a read failure or any other value counts as a failure.
- */
-async function checkRestoreHomePositionOnAllDrives(eligible: Row[]): Promise<boolean> {
-  console.log(`Checking restore home position (0x2005:02) on all ${eligible.length} drive(s) before saving...\n`);
-
-  let allOk = true;
-  const results: { Device: string; Joint: string; "Restore Home Position (0x2005:02)": number | string; Status: string }[] = [];
-
-  for (const row of eligible) {
-    const liveDevice = row.liveDevice!;
-    try {
-      const value = await client.request.upload<number>(
-        liveDevice.deviceRef,
-        RESTORE_HOME_POSITION_INDEX,
-        RESTORE_HOME_POSITION_SUBINDEX,
-        false,
-        requestTimeout,
-      );
-      const ok = value === 1;
-      if (!ok) allOk = false;
-      results.push({ Device: row.deviceNumber, Joint: row.label, "Restore Home Position (0x2005:02)": value, Status: ok ? "OK" : "NOT 1" });
-    } catch (err: any) {
-      allOk = false;
-      results.push({
-        Device: row.deviceNumber,
-        Joint: row.label,
-        "Restore Home Position (0x2005:02)": "-",
-        Status: `READ FAILED (${err?.message ?? err})`,
-      });
-    }
-  }
-
-  console.table(results);
-  return allOk;
-}
-
-/**
- * Stage 4: asks for confirmation, then, for every device Stage 3 calculated a correction for,
- * checks that restore home position (0x2005:02) reads 1 on every device that went through
- * Stage 2 — if not, the whole save step is refused. Otherwise writes each calculated home
- * offset (0x607C:00, a plain SDO download), verifies it, and — only once verified — SAVES all
- * parameters currently on that device (0x1010: Store parameters) so they persist across a power
- * cycle. This means the polarity change from Stage 2 (previously volatile) becomes persistent
- * too, since save-config persists the device's entire current parameter set, not just the home
- * offset. Finally, regardless of any of the above, reads and prints the Actual position value
- * (0x6064:00), in degrees, for every device that went through Stage 2 (every MATCH and MISMATCH
- * device), so the operator can see where every joint stands after the whole process.
- */
-async function applyHomeOffsetsAndReportPosition(eligible: Row[], pending: PendingHomeOffsetAdjustment[]): Promise<void> {
-  logStage(4, "Apply home offsets and report actual position");
-
-  if (pending.length === 0) {
-    console.log("No home offset corrections to apply.\n");
-  } else {
-    console.log(`The following ${pending.length} device(s) will have their home offset (0x607C:00) adjusted:\n`);
-    console.table(
-      pending.map(({ row, positionDegrees, newHomeOffsetCounts }) => ({
-        Device: row.deviceNumber,
-        Joint: row.label,
-        "Position (deg)": positionDegrees.toFixed(2),
-        "New Home Offset (counts)": newHomeOffsetCounts,
-      })),
-    );
-    console.log(
-      "\nOnce written and verified, ALL parameters currently on each device — including this home\n" +
-        "offset and any polarity change from Stage 2 — will be SAVED (0x1010: Store parameters), so\n" +
-        "they persist across a power cycle.\n",
-    );
-
-    const confirmed = await confirm(
-      `Type "yes" to apply these ${pending.length} home offset adjustment(s) and save all parameters, anything else to abort: `,
-    );
-    if (!confirmed) {
-      console.log("\nAborted — no home offset changes applied or saved.\n");
-    } else {
-      const restoreHomePositionOk = await checkRestoreHomePositionOnAllDrives(eligible);
-      if (!restoreHomePositionOk) {
-        console.log(
-          "\n[ABORT] Restore home position (0x2005:02) is not 1 on all drives — refusing to write or save any home offset.\n",
-        );
-      } else {
-        const results: { Device: string; Joint: string; Status: string }[] = [];
-        for (const { row, newHomeOffsetCounts } of pending) {
-          const liveDevice = row.liveDevice!;
-          try {
-            await client.request.download(liveDevice.deviceRef, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX, newHomeOffsetCounts, undefined, requestTimeout);
-
-            const verified = await client.request.upload<number>(liveDevice.deviceRef, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX, false, requestTimeout);
-            if (verified !== newHomeOffsetCounts) {
-              results.push({ Device: row.deviceNumber, Joint: row.label, Status: `VERIFY FAILED (read back ${verified})` });
-              continue;
-            }
-
-            try {
-              await lastValueFrom(client.request.saveConfig(liveDevice.deviceRef));
-              results.push({ Device: row.deviceNumber, Joint: row.label, Status: "APPLIED & SAVED" });
-            } catch (err: any) {
-              results.push({ Device: row.deviceNumber, Joint: row.label, Status: `APPLIED, SAVE FAILED (${err?.message ?? err})` });
-            }
-          } catch (err: any) {
-            results.push({ Device: row.deviceNumber, Joint: row.label, Status: `WRITE FAILED (${err?.message ?? err})` });
-          }
-        }
-
-        console.log("=== Home offset apply summary ===");
-        console.table(results);
-        console.log("Parameters were saved (0x1010) on every successfully applied device — they now persist across a power cycle.\n");
-      }
-    }
-  }
-
-  console.log("Actual position for all devices:\n");
-  const positionResults: { Device: string; Joint: string; "Position (deg)": string }[] = [];
-  for (const row of eligible) {
-    const liveDevice = row.liveDevice!;
-    try {
-      const positionCounts = await client.request.upload<number>(
-        liveDevice.deviceRef,
-        POSITION_ACTUAL_INDEX,
-        POSITION_ACTUAL_SUBINDEX,
-        false,
-        requestTimeout,
-      );
-      positionResults.push({ Device: row.deviceNumber, Joint: row.label, "Position (deg)": countsToDegrees(positionCounts).toFixed(2) });
-    } catch (err: any) {
-      positionResults.push({ Device: row.deviceNumber, Joint: row.label, "Position (deg)": `FAILED (${err?.message ?? err})` });
-    }
-  }
-  console.table(positionResults);
+  if (failure) throw new Error(`Stage 4 failed at ${failure}.`);
 }
 
 /**
@@ -1041,31 +1480,11 @@ async function applyQuickStopAndSs1Configuration(eligible: Row[]): Promise<void>
   );
 }
 
-async function main(): Promise<void> {
-  if (!diagnose && !apply) {
-    console.log(
-      "\nNothing to do — pass --diagnose to check device polarity against the config files (read-only, does not modify any parameter), " +
-        "or --apply to also write mismatching devices after confirmation.\n",
-    );
-    return;
-  }
-
-  logStage(0, `Diagnose system polarity${deviceNumber ? ` for device "${deviceNumber}"` : " for all devices"}`);
-
-  const sourceConfigsByNumber = scanSourceConfigs(configDir);
-  const deviceNumbers = [...sourceConfigsByNumber.keys()]
-    .filter((n) => !deviceNumber || n === deviceNumber)
-    .sort((a, b) => Number(a) - Number(b));
-
-  if (deviceNumbers.length === 0) {
-    throw new Error(
-      deviceNumber
-        ? `No config file in ${configDir} has a 0x20F2:00 label starting with "${deviceNumber}".`
-        : `No config file in ${configDir} has a 0x20F2:00 label.`,
-    );
-  }
-
-  await client.whenReady();
+/** Pairs every config file with the live device sharing its joint number and compares the polarity. */
+async function buildRows(
+  sourceConfigsByNumber: Map<string, SourceConfig[]>,
+  deviceNumbers: string[],
+): Promise<{ rows: Row[]; liveDevicesByNumber: Map<string, LiveDevice[]> }> {
   const liveDevicesByNumber = await scanLiveDevices();
 
   const rows: Row[] = [];
@@ -1123,6 +1542,14 @@ async function main(): Promise<void> {
     });
   }
 
+  return { rows, liveDevicesByNumber };
+}
+
+function printDiagnosis(
+  rows: Row[],
+  liveDevicesByNumber: Map<string, LiveDevice[]>,
+  sourceConfigsByNumber: Map<string, SourceConfig[]>,
+): void {
   console.log();
   console.table(
     rows.map((r) => ({
@@ -1159,8 +1586,43 @@ async function main(): Promise<void> {
     }
     console.log();
   }
+}
+
+async function main(): Promise<void> {
+  if (!diagnose && !apply) {
+    console.log(
+      "\nNothing to do — pass --diagnose to check device polarity against the config files (read-only, does not modify any parameter), " +
+        "or --apply to also write mismatching devices after confirmation.\n",
+    );
+    return;
+  }
+
+  logStage(0, `Diagnose system polarity${deviceNumber ? ` for device "${deviceNumber}"` : " for all devices"}`);
+
+  const sourceConfigsByNumber = scanSourceConfigs(configDir);
+  const deviceNumbers = [...sourceConfigsByNumber.keys()]
+    .filter((n) => !deviceNumber || n === deviceNumber)
+    .sort((a, b) => Number(a) - Number(b));
+
+  if (deviceNumbers.length === 0) {
+    throw new Error(
+      deviceNumber
+        ? `No config file in ${configDir} has a 0x20F2:00 label starting with "${deviceNumber}".`
+        : `No config file in ${configDir} has a 0x20F2:00 label.`,
+    );
+  }
+
+  await client.whenReady();
+  let { rows, liveDevicesByNumber } = await buildRows(sourceConfigsByNumber, deviceNumbers);
+  printDiagnosis(rows, liveDevicesByNumber, sourceConfigsByNumber);
 
   if (apply) {
+    const namesAssigned = await assignNames();
+    if (namesAssigned) {
+      logStage(0, "Diagnose system polarity again, now that the names are assigned");
+      ({ rows, liveDevicesByNumber } = await buildRows(sourceConfigsByNumber, deviceNumbers));
+      printDiagnosis(rows, liveDevicesByNumber, sourceConfigsByNumber);
+    }
     await applyPolarity(rows);
   }
 }
