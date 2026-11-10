@@ -23,13 +23,22 @@
  *     large warning that the EtherCAT network must be wired exactly the same as on the robot the
  *     files came from and that cabling is assumed monotonic. After the labels are saved, Stage 0
  *     is run again so the later stages see the new names.
- *   Stage 2 (--apply only): ask for confirmation, then check STO (Safe Torque Off — bit 0 of the
+ *   Stage 2 (--apply only, unless --skip-load-configs): load each paired config file onto its drive,
+ *     so the robot gets its configuration in the same run (this replaces `load-drive-configs.ts`).
+ *     The Home Offset (0x607C) is NEVER loaded — the script prints that it is leaving it out, and
+ *     the file's value for it — because no home offset is used: Stage 4 homes every joint where it
+ *     is and the Home Offset must stay 0. --exclude adds more objects to leave out (e.g. the
+ *     per-drive commutation offset 0x2001:00). The strategy is "merge": Motion Master reads the
+ *     drive's existing config.csv, applies the file's rows on top and writes the result back, so an
+ *     excluded object keeps the value the drive already has. SMM safety parameters and the joint
+ *     label 0x20F2:00 are always left out. Asks for confirmation, and repeats Stage 0 afterwards.
+ *   Stage 3 (--apply only): ask for confirmation, then check STO (Safe Torque Off — bit 0 of the
  *     Safety Statusword's first byte, 0x6621:01) on every device; if STO is active (or
  *     unreadable) on any of them, the run aborts with a warning to release STO, since the
  *     transition cannot succeed while STO is active. Otherwise writes the system polarity from
  *     the config file (MISMATCH devices only) and cycles the controlword 0 -> 6 -> 7 on every
- *     MATCH/MISMATCH device. The polarity is saved in Stage 3.
- *   Stage 3 (--apply only): for every joint that completed Stage 2, centre the Encoder 2 single
+ *     MATCH/MISMATCH device. The polarity is saved in Stage 4.
+ *   Stage 4 (--apply only): for every joint that completed Stage 3, centre the Encoder 2 single
  *     turn range and home the joint there. Read --samples (5-10) samples of Encoder 2 feedback Raw
  *     (0x2113:01) and Adjusted (0x2113:02) position per drive, calculate the single turn offset
  *     (IF raw < resolution/2 THEN raw + 2^19 ELSE raw - 2^19) and print a table with the adjusted
@@ -42,17 +51,17 @@
  *     the homing is done the Home Offset must still be 0 and the Actual position close to 0,
  *     otherwise the run FAILS LOUDLY and stops. Each drive is returned to Switched on disabled.
  *     Start with the robot mechanically zeroed (or at the zero you want).
- *   Stage 4 (--apply only): ask for confirmation, then SAVE ALL PARAMETERS on every homed device
+ *   Stage 5 (--apply only): ask for confirmation, then SAVE ALL PARAMETERS on every homed device
  *     (0x1010: Store parameters) so the homed position persists, and print the Actual position
  *     (0x6064:00) and Home Offset (0x607C:00); a non-zero Home Offset fails loudly.
- *   Stage 5 (--apply only): ask for confirmation, then write the software position limits
+ *   Stage 6 (--apply only): ask for confirmation, then write the software position limits
  *     (0x607D:01 min, 0x607D:02 max) from each device's matched config file to that device, for
- *     every device that went through Stage 2 whose config file has both values, and — once
+ *     every device that went through Stage 3 whose config file has both values, and — once
  *     verified — SAVE ALL PARAMETERS on that device (0x1010: Store parameters). Prints a
  *     summary in degrees (assuming a 20-bit encoder).
  *   Stage 7 ("Quick and SS1 Configuration", --apply only): applies the same Quick Stop / SS1
  *     safety configuration as `Damping Configuration/configure-damping-parameters.promise.ts`,
- *     to every device that went through Stage 2. Quick stop option code (0x605A:00) and ASC
+ *     to every device that went through Stage 3. Quick stop option code (0x605A:00) and ASC
  *     duration (0x2010:12) are plain CoE objects written via a direct SDO download then SAVED
  *     (0x1010: Store parameters); the three SMM safety parameters (0x2641:01, 0x2650:01,
  *     0x6651:01) are written through the authenticated SMM configuration flow (login ->
@@ -64,12 +73,12 @@
  * With `--diagnose` only, Stage 0 does NOT write anything to the device — it only reads and
  * reports.
  *
- * `--apply` runs Stage 0 first, then Stages 1-5 and 7 (there is no Stage 6). A failure in
- * Stages 1-4 throws and stops the run, so the later stages never run on a half-commissioned
- * robot. Stage 3 and 4 make the parameter writes persistent (0x1010); the polarity is written in
- * Stage 2 and saved in Stage 3.
+ * `--apply` runs Stage 0 first, then Stages 1-7. A failure in
+ * Stages 1-5 throws and stops the run, so the later stages never run on a half-commissioned
+ * robot. Stage 4 and 5 make the parameter writes persistent (0x1010); the polarity is written in
+ * Stage 3 and saved in Stage 4.
  *
- * This script ENERGIZES the drives (Stage 2 cycles the controlword to Switch on; Stage 3 enables
+ * This script ENERGIZES the drives (Stage 3 cycles the controlword to Switch on; Stage 4 enables
  * operation for homing). Run it yourself at the robot with the approved E-stop/STO within reach.
  *
  * Usage:
@@ -94,6 +103,8 @@ import { Option, program } from "commander";
 import {
   ConfigFile,
   ConfigParameter,
+  isSmmParameterIndex,
+  LoadConfigStrategy,
   convertGroupedSmmParametersToTransmitData,
   mapByProperty,
   parametersCompareFn,
@@ -170,8 +181,41 @@ const QUICK_STOP_SANITY_CHECK_PARAMETERS: { index: number; subindex: number; val
 
 const DEFAULT_CONFIG_DIR = join(__dirname, "drive_configs");
 
+/** `0x2001:00` -> that subindex only; `0x2001` -> every subindex of the object. */
+interface ExclusionRule {
+  index: number;
+  subindex?: number;
+  raw: string;
+  reason: string;
+}
+
+function parseExclusions(raw: string, reason: string): ExclusionRule[] {
+  return raw
+    .split(",")
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0)
+    .map((token) => {
+      const [indexPart, subindexPart] = token.split(":");
+      const index = parseInt(indexPart, 16);
+      if (isNaN(index)) throw new Error(`Invalid ${reason} entry "${token}". Expected e.g. 0x2001:00 or 0x2001.`);
+      if (subindexPart === undefined) return { index, raw: token, reason };
+      const subindex = parseInt(subindexPart, 10);
+      if (isNaN(subindex)) throw new Error(`Invalid subindex in ${reason} entry "${token}".`);
+      return { index, subindex, raw: token, reason };
+    });
+}
+
+/**
+ * Never loaded by Stage 2: the Home Offset (0x607C). Stage 4 homes every joint at its current
+ * position and NO home offset is used — it must be 0 — so a value carried by a config file (some
+ * exported ones hold 1048576, i.e. 360 degrees) must not reach the drive.
+ */
+const ALWAYS_EXCLUDED_FROM_LOAD: ExclusionRule[] = [
+  { index: 0x607c, raw: "0x607C", reason: "Home Offset must stay 0 (no home offset is used)" },
+];
+
 program.addOption(new Option("--diagnose", "Check current polarity for all devices connected to Motion Master against their config files (read-only; does not modify any parameter)").default(false));
-program.addOption(new Option("--apply", "Stages 1-7: after diagnosing (Stage 0), optionally assign names by slave position (1, with --assign-names), confirm then write 0x200D:00 from the config files on mismatching devices and cycle the controlword 0 -> 6 -> 7 (2), then set the Encoder 2 single turn offset so the encoder is in the middle of its single-turn range and home each joint there with method 37, one by one, failing loudly if the Home Offset is not 0 (3), save and report actual position (4), write + save software position limits (0x607D:01/02) from each config file (5), then apply Quick Stop / SS1 safety configuration via the SMM (7). Implies --diagnose.").default(false));
+program.addOption(new Option("--apply", "Stages 1-7: after diagnosing (Stage 0), optionally assign names by slave position (1, with --assign-names), load the config files without 0x607C (2), confirm then write 0x200D:00 from the config files on mismatching devices and cycle the controlword 0 -> 6 -> 7 (2), then set the Encoder 2 single turn offset so the encoder is in the middle of its single-turn range and home each joint there with method 37, one by one, failing loudly if the Home Offset is not 0 (3), save and report actual position (4), write + save software position limits (0x607D:01/02) from each config file (5), then apply Quick Stop / SS1 safety configuration via the SMM (7). Implies --diagnose.").default(false));
 program.addOption(new Option("--device-number <value>", "Only check the joint matching this number at 0x20F2:00, e.g. 104. If omitted, every config file is checked."));
 program.addOption(new Option("--assign-names", "Stage 1: write each drive's joint label (0x20F2:00) from the position_<NN>_*.csv files, by position in the EtherCAT chain (use --ignore_ecat_indices)").default(false));
 program.addOption(
@@ -185,20 +229,27 @@ program.addOption(
       }),
     ),
 );
-program.addOption(new Option("--samples <n>", "Stage 3: samples of the Encoder 2 position to read per drive (5-10)").default(10).argParser((v: string) => {
+program.addOption(new Option("--skip-load-configs", "Stage 2: do not load the config files onto the drives").default(false));
+program.addOption(
+  new Option(
+    "--exclude <ids>",
+    "Stage 2: comma-separated objects to leave out of every config load IN ADDITION to 0x607C (Home Offset), e.g. 0x2001:00,0x2112 (an entry without a subindex excludes every subindex)",
+  ).argParser((raw: string) => parseExclusions(raw, "--exclude")),
+);
+program.addOption(new Option("--samples <n>", "Stage 4: samples of the Encoder 2 position to read per drive (5-10)").default(10).argParser((v: string) => {
   const n = parseInt(v, 10);
   if (!Number.isInteger(n) || n < 5 || n > 10) throw new Error(`Invalid --samples "${v}". Expected 5-10.`);
   return n;
 }));
-program.addOption(new Option("--resolution-bits <n>", "Stage 3: Encoder 2 single-turn resolution in bits (the middle is 2^(n-1))").default(20).argParser((v: string) => {
+program.addOption(new Option("--resolution-bits <n>", "Stage 4: Encoder 2 single-turn resolution in bits (the middle is 2^(n-1))").default(20).argParser((v: string) => {
   const n = parseInt(v, 10);
   if (!Number.isInteger(n) || n < 2 || n > 31) throw new Error(`Invalid --resolution-bits "${v}".`);
   return n;
 }));
-program.addOption(new Option("--max-spread <counts>", "Stage 3: refuse a drive whose raw Encoder 2 position varies by more than this over the samples").default(16).argParser(Number));
-program.addOption(new Option("--tolerance <counts>", "Stage 3: how far from the middle the read-back adjusted position may be").default(4).argParser(Number));
-program.addOption(new Option("--home-tolerance-deg <deg>", "Stage 3: largest |Actual position| after homing that counts as close to 0").default(0.5).argParser(Number));
-program.addOption(new Option("--pause-ms <ms>", "Stage 3: pause after announcing each joint, before it is processed").default(2000).argParser((v: string) => {
+program.addOption(new Option("--max-spread <counts>", "Stage 4: refuse a drive whose raw Encoder 2 position varies by more than this over the samples").default(16).argParser(Number));
+program.addOption(new Option("--tolerance <counts>", "Stage 4: how far from the middle the read-back adjusted position may be").default(4).argParser(Number));
+program.addOption(new Option("--home-tolerance-deg <deg>", "Stage 4: largest |Actual position| after homing that counts as close to 0").default(0.5).argParser(Number));
+program.addOption(new Option("--pause-ms <ms>", "Stage 4: pause after announcing each joint, before it is processed").default(2000).argParser((v: string) => {
   const n = parseInt(v, 10);
   if (!Number.isInteger(n) || n < 0) throw new Error(`Invalid --pause-ms "${v}".`);
   return n;
@@ -217,6 +268,8 @@ const {
   username,
   password,
   assignNames: assignNamesRequested,
+  skipLoadConfigs,
+  exclude: extraLoadExclusions = [] as ExclusionRule[],
   ignore_ecat_indices: ignoredEcatIndices,
   samples: encoderSamples,
   resolutionBits,
@@ -233,6 +286,8 @@ const {
   username: string;
   password: string;
   assignNames: boolean;
+  skipLoadConfigs: boolean;
+  exclude?: ExclusionRule[];
   ignore_ecat_indices: number[];
   samples: number;
   resolutionBits: number;
@@ -380,6 +435,8 @@ interface Row {
   /** Present only for MATCH/MISMATCH rows, where exactly one live device and file value were resolved. */
   liveDevice?: LiveDevice;
   filePolarityValue?: number;
+  /** The config file this row was paired with (rows with a live device only). */
+  filePath?: string;
   fileMinPositionLimitCounts?: number;
   fileMaxPositionLimitCounts?: number;
 }
@@ -661,15 +718,125 @@ async function assignNames(): Promise<boolean> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Stage 2: polarity from the config files
+// Stage 2: load the config files, without 0x607C
+// ---------------------------------------------------------------------------------------------
+
+const objectId = (p: Pick<ConfigParameter, "index" | "subindex">) =>
+  `0x${p.index.toString(16).toUpperCase().padStart(4, "0")}:${String(p.subindex).padStart(2, "0")}`;
+
+/** Merge keeps what the drive already has for every object the file does not carry (or that is excluded). */
+const LOAD_CONFIG_STRATEGY: LoadConfigStrategy = "merge";
+
+/**
+ * Stage 2: loads each paired config file onto its drive, leaving out the Home Offset (0x607C)
+ * and anything given with --exclude, and says so on the console.
+ *
+ * The strategy is "merge": Motion Master reads the drive's existing config.csv, applies the
+ * file's rows on top and writes the result back, so an excluded object keeps the value the drive
+ * already has. Always dropped as well: the SMM safety parameters (the safety layer ignores plain
+ * writes to them) and the joint label 0x20F2:00, so a label can never end up on the wrong drive.
+ *
+ * Returns true when at least one config was loaded, so the caller re-runs the Stage 0 pairing.
+ */
+async function loadConfigs(rows: Row[]): Promise<boolean> {
+  logStage(2, "Load the config files onto the drives, without 0x607C (Home Offset)");
+
+  if (skipLoadConfigs) {
+    console.log("Skipped (--skip-load-configs).\n");
+    return false;
+  }
+
+  const exclusions = [...ALWAYS_EXCLUDED_FROM_LOAD, ...extraLoadExclusions];
+  console.warn("[EXCLUDE] These objects are NOT loaded on any drive:");
+  for (const rule of exclusions) console.warn(`  - ${rule.raw}${rule.subindex === undefined ? " (every subindex)" : ""}: ${rule.reason}`);
+  console.warn("  - SMM safety parameters and the joint label 0x20F2:00: always left out\n");
+
+  interface LoadTarget {
+    row: Row;
+    configFile: ConfigFile;
+    total: number;
+    dropped: { p: ConfigParameter; reason: string }[];
+  }
+  const targets: LoadTarget[] = [];
+  for (const row of rows) {
+    if (!row.liveDevice || !row.filePath) continue;
+    const configFile = new ConfigFile(readFileSync(row.filePath, "utf-8"));
+    const total = configFile.numberOfParameters;
+    const dropped: LoadTarget["dropped"] = [];
+    configFile.parameters = configFile.parameters.filter((p) => {
+      const rule = exclusions.find((r) => r.index === p.index && (r.subindex === undefined || r.subindex === p.subindex));
+      if (rule) {
+        dropped.push({ p, reason: `excluded ${rule.raw}` });
+        return false;
+      }
+      if (isSmmParameterIndex(p.index)) {
+        dropped.push({ p, reason: "SMM safety parameter" });
+        return false;
+      }
+      if (p.index === DEVICE_LABEL_INDEX && p.subindex === DEVICE_LABEL_SUBINDEX) {
+        dropped.push({ p, reason: "joint label" });
+        return false;
+      }
+      return true;
+    });
+    targets.push({ row, configFile, total, dropped });
+  }
+
+  if (targets.length === 0) {
+    console.log("No device is paired with a config file — nothing to load.\n");
+    return false;
+  }
+
+  console.table(
+    targets.map((t) => ({
+      Device: t.row.deviceNumber,
+      Joint: t.row.label,
+      File: t.row.filePath!.split("/").pop(),
+      "To send": `${t.configFile.parameters.length} of ${t.total}`,
+      "Excluded": t.dropped.length,
+    })),
+  );
+  for (const t of targets) {
+    for (const { p, reason } of t.dropped) {
+      if (reason.startsWith("excluded")) console.log(`  [EXCLUDE] ${t.row.label}: ${objectId(p)} = ${p.value} not loaded (${reason})`);
+    }
+  }
+
+  console.log(`\nStrategy: ${LOAD_CONFIG_STRATEGY} — what the drive already has is kept for every object that is not sent.\n`);
+  if (!(await confirm(`Type "yes" to load these ${targets.length} config(s), anything else to skip loading: `))) {
+    console.log("\nSkipped — no config loaded.\n");
+    return false;
+  }
+
+  const results: { Device: string; Joint: string; Status: string }[] = [];
+  for (const t of targets) {
+    try {
+      await lastValueFrom(
+        client.request.loadConfig(t.row.liveDevice!.deviceRef, t.configFile.toString(), LOAD_CONFIG_STRATEGY, { count: 10, delay: 500 }),
+      );
+      results.push({ Device: t.row.deviceNumber, Joint: t.row.label, Status: `LOADED (${t.configFile.parameters.length} parameter(s), ${t.dropped.length} excluded)` });
+    } catch (err: any) {
+      results.push({ Device: t.row.deviceNumber, Joint: t.row.label, Status: `FAILED (${err?.message ?? err})` });
+    }
+  }
+
+  console.log("\n=== Load configs summary ===");
+  console.table(results);
+  const failed = results.filter((r) => !r.Status.startsWith("LOADED"));
+  if (failed.length > 0) throw new Error(`${failed.length} config(s) were not loaded — see the table.`);
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stage 3: polarity from the config files
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Stage 2: prompts for confirmation, then processes every row with a resolved polarity
+ * Stage 3: prompts for confirmation, then processes every row with a resolved polarity
  * comparison (status MATCH or MISMATCH):
  *   - MISMATCH: writes 0x200D:00 to match the config file (a plain SDO download to the
  *     device's live parameter set), verifies it, then cycles the controlword. The write is saved
- *     in Stage 3 together with the Encoder 2 single turn offset.
+ *     in Stage 4 together with the Encoder 2 single turn offset.
  *   - MATCH: nothing is written; the controlword is still cycled.
  * In both cases the controlword (0x6040:00) is cycled through 0 -> 6 -> 7 (clear -> Shutdown
  * -> Switch On) — but only after confirming STO is inactive on every device (see
@@ -683,7 +850,7 @@ async function applyPolarity(rows: Row[]): Promise<void> {
     return;
   }
 
-  logStage(2, "Apply system polarity from the config files");
+  logStage(3, "Apply system polarity from the config files");
 
   const mismatchCount = eligible.filter((r) => r.status === "MISMATCH").length;
   console.log(
@@ -701,7 +868,7 @@ async function applyPolarity(rows: Row[]): Promise<void> {
     })),
   );
   console.log(
-    "\nMismatching devices get 0x200D:00 written to their live parameter set; it is saved in Stage 3 with the\n" +
+    "\nMismatching devices get 0x200D:00 written to their live parameter set; it is saved in Stage 4 with the\n" +
       "Encoder 2 single turn offset. Every listed device then has its controlword (0x6040:00) cycled 0 -> 6 -> 7.\n",
   );
 
@@ -755,7 +922,7 @@ async function applyPolarity(rows: Row[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Stage 3: Encoder 2 single turn offset, then homing
+// Stage 4: Encoder 2 single turn offset, then homing
 // ---------------------------------------------------------------------------------------------
 
 /** Wraps `n` into [0, ENCODER2_RESOLUTION). */
@@ -940,7 +1107,7 @@ async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok
 }
 
 /**
- * Stage 3: for every joint that completed Stage 2, centres the Encoder 2 single turn range and
+ * Stage 4: for every joint that completed Stage 3, centres the Encoder 2 single turn range and
  * homes the joint there, one joint after the other:
  *
  *   1. Read --samples (5-10) samples of Encoder 2 feedback Raw (0x2113:01) and Adjusted
@@ -957,7 +1124,7 @@ async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok
  * never run on a half-commissioned robot. Returns the homed rows, or undefined when aborted.
  */
 async function centreEncodersAndHome(eligible: Row[], stage2StatusByDevice: Map<string, string>): Promise<Row[] | undefined> {
-  logStage(3, "Set Encoder 2 single turn offset and home at the middle of the range");
+  logStage(4, "Set Encoder 2 single turn offset and home at the middle of the range");
 
   console.log(
     `Every joint must be at its home position (mechanical zero, or the zero you want) before this stage.\n` +
@@ -997,18 +1164,18 @@ async function centreEncodersAndHome(eligible: Row[], stage2StatusByDevice: Map<
   const skipped = plans.filter((p) => p.skip);
   if (skipped.length > 0) {
     throw new Error(
-      `${skipped.length} joint(s) cannot go through Stage 3: ${skipped.map((p) => `${p.row.label} [${p.skip}]`).join("; ")}. ` +
+      `${skipped.length} joint(s) cannot go through Stage 4: ${skipped.map((p) => `${p.row.label} [${p.skip}]`).join("; ")}. ` +
         `Resolve this and re-run — homing only some of the joints would leave the robot half-commissioned.`,
     );
   }
 
   banner([
-    `Stage 3 will ENERGIZE ${plans.length} drive(s), one after the other: Operation enabled, Homing mode`,
+    `Stage 4 will ENERGIZE ${plans.length} drive(s), one after the other: Operation enabled, Homing mode`,
     `It saves 0x2112:06 so the Encoder 2 position reads ${ENCODER2_HALF}, then homes with method 37 where the joint is now`,
     "Method 37 is not meant to move the joint - keep clear and keep the approved E-stop/STO within reach",
   ]);
   if (!(await confirm(`Type "yes" to set the offset, save and home these ${plans.length} joint(s) one by one, anything else to abort: `))) {
-    console.log("\nAborted — nothing written in Stage 3.\n");
+    console.log("\nAborted — nothing written in Stage 4.\n");
     return undefined;
   }
 
@@ -1057,28 +1224,28 @@ async function centreEncodersAndHome(eligible: Row[], stage2StatusByDevice: Map<
     }
   }
 
-  console.log("\n=== Stage 3 summary ===");
+  console.log("\n=== Stage 4 summary ===");
   console.table(results);
   if (failure) {
     throw new Error(
-      `Stage 3 failed at ${failure}. ${plans.length - results.length} joint(s) were not processed; nothing after Stage 3 was run.`,
+      `Stage 4 failed at ${failure}. ${plans.length - results.length} joint(s) were not processed; nothing after Stage 4 was run.`,
     );
   }
   return homed;
 }
 
 // ---------------------------------------------------------------------------------------------
-// Stage 4: save and report
+// Stage 5: save and report
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Stage 4: asks for confirmation, then SAVES all parameters on every homed device (0x1010: Store
+ * Stage 5: asks for confirmation, then SAVES all parameters on every homed device (0x1010: Store
  * parameters) so the homed position (Restore home position = 1) and everything written in Stages
  * 2 and 3 persist across a power cycle, and reports each device's Actual position (0x6064:00) and
  * Home Offset (0x607C:00). A Home Offset that is not 0 fails loudly.
  */
 async function saveAndReportPositions(homed: Row[]): Promise<void> {
-  logStage(4, "Save parameters and report actual position");
+  logStage(5, "Save parameters and report actual position");
 
   if (homed.length === 0) {
     console.log("No homed devices — nothing to save.\n");
@@ -1097,7 +1264,15 @@ async function saveAndReportPositions(homed: Row[]): Promise<void> {
     const d = row.liveDevice!;
     let status = confirmed ? "SAVED" : "NOT SAVED";
     try {
-      if (confirmed) await lastValueFrom(client.request.saveConfig(d.deviceRef));
+      if (confirmed) {
+        // The homed position only persists with Restore home position when loading configuration = 1 (YES).
+        if ((await readObject(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX)) !== 1) {
+          await writeObject(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, 1);
+        }
+        const restore = await readObject(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX);
+        if (restore !== 1) throw new Error(`Restore home position (0x2005:02) reads ${restore}, it must be 1 to persist the homed position`);
+        await lastValueFrom(client.request.saveConfig(d.deviceRef));
+      }
       const degrees = countsToDegrees(await readObject(d, POSITION_ACTUAL_INDEX, POSITION_ACTUAL_SUBINDEX));
       const homeOffset = await readObject(d, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX);
       if (homeOffset !== 0) {
@@ -1112,20 +1287,20 @@ async function saveAndReportPositions(homed: Row[]): Promise<void> {
     }
   }
   console.table(results);
-  if (failure) throw new Error(`Stage 4 failed at ${failure}.`);
+  if (failure) throw new Error(`Stage 5 failed at ${failure}.`);
 }
 
 /**
- * Stage 5: applies the software position limits (0x607D:01 min, 0x607D:02 max) from each
- * device's matched config file to that live device, for every device that went through Stage 2
+ * Stage 6: applies the software position limits (0x607D:01 min, 0x607D:02 max) from each
+ * device's matched config file to that live device, for every device that went through Stage 3
  * (both MATCH and MISMATCH) whose config file has both values. Asks for confirmation before
  * writing anything. This write is NOT saved/persisted by this stage (no 0x1010 store
  * parameters) — it only lasts until the next power cycle or config reload, unless the device
- * was separately saved in Stage 4. Prints a summary table converted to degrees, assuming a
+ * was separately saved in Stage 5. Prints a summary table converted to degrees, assuming a
  * 20-bit position encoder.
  */
 async function applySoftwarePositionLimits(eligible: Row[]): Promise<void> {
-  logStage(5, "Apply software position limits");
+  logStage(6, "Apply software position limits");
 
   const withLimits = eligible.filter((r) => r.fileMinPositionLimitCounts !== undefined && r.fileMaxPositionLimitCounts !== undefined);
   const withoutLimits = eligible.filter((r) => r.fileMinPositionLimitCounts === undefined || r.fileMaxPositionLimitCounts === undefined);
@@ -1336,7 +1511,7 @@ interface QuickStopSs1Preview {
 /**
  * Stage 7: applies the Quick Stop / SS1 (Safe Stop 1) safety configuration — the same parameters
  * `Damping Configuration/configure-damping-parameters.promise.ts` writes — to every device that
- * went through Stage 2 (both MATCH and MISMATCH):
+ * went through Stage 3 (both MATCH and MISMATCH):
  *   - Quick stop option code (0x605A:00) and ASC duration (0x2010:12): plain CoE objects,
  *     written via a direct SDO download, then saved (0x1010: Store parameters).
  *   - Three SMM safety parameters (0x2641:01, 0x2650:01, 0x6651:01): written through the
@@ -1537,6 +1712,7 @@ async function buildRows(
       status,
       liveDevice,
       filePolarityValue: config.filePolarity,
+      filePath: config.filePath,
       fileMinPositionLimitCounts: config.fileMinPositionLimitCounts,
       fileMaxPositionLimitCounts: config.fileMaxPositionLimitCounts,
     });
@@ -1620,6 +1796,12 @@ async function main(): Promise<void> {
     const namesAssigned = await assignNames();
     if (namesAssigned) {
       logStage(0, "Diagnose system polarity again, now that the names are assigned");
+      ({ rows, liveDevicesByNumber } = await buildRows(sourceConfigsByNumber, deviceNumbers));
+      printDiagnosis(rows, liveDevicesByNumber, sourceConfigsByNumber);
+    }
+    const configsLoaded = await loadConfigs(rows);
+    if (configsLoaded) {
+      logStage(0, "Diagnose system polarity again, now that the configs are loaded");
       ({ rows, liveDevicesByNumber } = await buildRows(sourceConfigsByNumber, deviceNumbers));
       printDiagnosis(rows, liveDevicesByNumber, sourceConfigsByNumber);
     }
