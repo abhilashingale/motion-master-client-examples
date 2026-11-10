@@ -23,21 +23,15 @@
  *      (YES), save all parameters (0x1010: Store parameters), then read Adjusted position back.
  *      The drive counts as a SUCCESS only when it reads 2^19 within --tolerance counts. On
  *      anything else the previous offset and restore flag are written back and saved.
- *   4. With --home, for the successful drives only: perform Homing at the current position
- *      (method 37) and re-check that the Actual position (0x6064:00) is close to 0.
- *
- * Steps 1-3 only read and write parameters. Step 4 (--home) puts the drive into Operation
- * enabled in Homing mode; method 37 defines the current position as home and is not meant to
- * move the shaft, but the drive IS energized, so it asks for a separate confirmation and must be
- * run by a person standing at the robot with the approved E-stop/STO within reach. The drive is
- * returned to Switched on disabled, and its previous mode of operation restored, afterwards.
+ * This only reads and writes parameters; it never energizes a drive. Homing at the current
+ * position (method 37) is a separate step: `home-joints.ts`.
  *
  * Drives are matched like the other scripts here: by the number at the start of the 0x20F2:00
  * label. Without --device-number every labelled drive is processed.
  *
  * Usage:
  *   # Read-only: table of adjusted position now, calculated ST offset and expected adjusted position.
- *   # Nothing is written and --home is ignored.
+ *   # Nothing is written.
  *   npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts --dry-run
  *
  *   # Set and save the offsets (asks for "yes" first)
@@ -45,9 +39,6 @@
  *
  *   # One joint only
  *   npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts --device-number 104
- *
- *   # Also home at the current position afterwards (separate confirmation)
- *   npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts --home
  */
 
 import { createInterface } from "readline";
@@ -66,29 +57,11 @@ const ENCODER2_RAW_SUBINDEX = 1;
 const ENCODER2_ADJUSTED_SUBINDEX = 2;
 const RESTORE_HOME_POSITION_INDEX = 0x2005;
 const RESTORE_HOME_POSITION_SUBINDEX = 2;
-const CONTROLWORD_INDEX = 0x6040;
 const STATUSWORD_INDEX = 0x6041;
-const MODES_OF_OPERATION_INDEX = 0x6060;
-const POSITION_ACTUAL_INDEX = 0x6064;
-const HOME_OFFSET_INDEX = 0x607c;
-const HOMING_METHOD_INDEX = 0x6098;
 
-const HOMING_MODE = 6;
-const HOMING_METHOD_CURRENT_POSITION = 37;
-const SW_FAULT = 1 << 3;
 const SW_OPERATION_ENABLED = 1 << 2;
-const SW_HOMING_ATTAINED = 1 << 12;
-const SW_HOMING_ERROR = 1 << 13;
-const CW_SHUTDOWN = 0x06;
-const CW_SWITCH_ON = 0x07;
-const CW_ENABLE_OPERATION = 0x0f;
-const CW_START_HOMING = 0x1f;
-const CW_DISABLE_VOLTAGE = 0x00;
 
-const ASSUMED_POSITION_ENCODER_BITS = 20;
 const SAMPLE_INTERVAL_MS = 100;
-const STATE_STEP_DELAY_MS = 200;
-const HOMING_TIMEOUT_MS = 10000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -122,12 +95,6 @@ program
       .argParser(Number),
   )
   .addOption(new Option("--device-number <value>", "only process the joint whose 0x20F2:00 label starts with this number, e.g. 104"))
-  .addOption(new Option("--home", "after success, perform Homing at the current position (method 37) and re-check the position").default(false))
-  .addOption(
-    new Option("--home-tolerance-deg <deg>", "largest |Actual position| after homing that counts as close to 0")
-      .default(0.5)
-      .argParser(Number),
-  )
   .addOption(new Option("--dry-run", "read and calculate only, write nothing").default(false));
 
 program.allowExcessArguments(false);
@@ -140,8 +107,6 @@ const {
   maxSpread,
   tolerance,
   deviceNumber,
-  home,
-  homeToleranceDeg,
   dryRun,
   requestTimeout = 10000,
 } = program.opts<{
@@ -150,8 +115,6 @@ const {
   maxSpread: number;
   tolerance: number;
   deviceNumber?: string;
-  home: boolean;
-  homeToleranceDeg: number;
   dryRun: boolean;
   requestTimeout?: number;
 }>();
@@ -320,61 +283,11 @@ async function applyOffset(p: Plan): Promise<Outcome> {
   }
 }
 
-/** Homing at the current position (method 37) on one drive; always returns it to Switched on disabled. */
-async function homeAtCurrentPosition(d: LiveDevice): Promise<string> {
-  let previousMode: number | undefined;
-  try {
-    previousMode = await upload(d, MODES_OF_OPERATION_INDEX, 0);
-    const homeOffset = await upload(d, HOME_OFFSET_INDEX, 0);
-
-    await download(d, MODES_OF_OPERATION_INDEX, 0, HOMING_MODE);
-    await download(d, HOMING_METHOD_INDEX, 0, HOMING_METHOD_CURRENT_POSITION);
-
-    for (const cw of [CW_SHUTDOWN, CW_SWITCH_ON, CW_ENABLE_OPERATION]) {
-      await download(d, CONTROLWORD_INDEX, 0, cw);
-      await sleep(STATE_STEP_DELAY_MS);
-    }
-    const afterEnable = await upload(d, STATUSWORD_INDEX, 0);
-    if (afterEnable & SW_FAULT || !(afterEnable & SW_OPERATION_ENABLED)) {
-      return `HOMING NOT STARTED (statusword 0x${afterEnable.toString(16)}: not operation enabled)`;
-    }
-
-    await download(d, CONTROLWORD_INDEX, 0, CW_START_HOMING);
-    const deadline = Date.now() + HOMING_TIMEOUT_MS;
-    let statusword = 0;
-    while (Date.now() < deadline) {
-      statusword = await upload(d, STATUSWORD_INDEX, 0);
-      if (statusword & (SW_HOMING_ATTAINED | SW_HOMING_ERROR | SW_FAULT)) break;
-      await sleep(50);
-    }
-    if (statusword & (SW_HOMING_ERROR | SW_FAULT)) return `HOMING ERROR (statusword 0x${statusword.toString(16)})`;
-    if (!(statusword & SW_HOMING_ATTAINED)) return `HOMING TIMEOUT (statusword 0x${statusword.toString(16)})`;
-
-    const counts = await upload(d, POSITION_ACTUAL_INDEX, 0);
-    const degrees = (counts / 2 ** ASSUMED_POSITION_ENCODER_BITS) * 360;
-    const close = Math.abs(degrees) <= homeToleranceDeg;
-    return (
-      `${close ? "HOMED" : "HOMED, POSITION NOT NEAR 0"} (actual position ${degrees.toFixed(3)}°, ` +
-      `home offset 0x607C:00 = ${homeOffset}${homeOffset !== 0 ? " — a non-zero home offset shifts the result" : ""})`
-    );
-  } catch (err: unknown) {
-    return `HOMING FAILED (${err instanceof Error ? err.message : err})`;
-  } finally {
-    try {
-      await download(d, CONTROLWORD_INDEX, 0, CW_DISABLE_VOLTAGE);
-      if (previousMode !== undefined) await download(d, MODES_OF_OPERATION_INDEX, 0, previousMode);
-    } catch {
-      console.error(`  [ERROR] could not return ${d.label} to Switched on disabled — check the drive.`);
-    }
-  }
-}
-
 async function main(): Promise<void> {
   console.log(`\n=== Set Encoder 2 single turn offset${dryRun ? " (DRY RUN)" : ""} ===`);
   banner([
     "Every joint must be at its HOME position before this step",
     `Sets 0x2112:06 so 0x2113:02 reads ${HALF} (middle of 2^${resolutionBits}) and SAVES it on the drive`,
-    ...(home && !dryRun ? ["--home: the drives will be ENERGIZED for Homing (method 37) - keep the E-stop/STO within reach"] : []),
   ]);
 
   let live = await scanLiveDevices();
@@ -414,7 +327,7 @@ async function main(): Promise<void> {
 
   const ready = plans.filter((p) => !p.skip);
   if (dryRun) {
-    console.log(`\nDry run — nothing written${home ? ", and --home is ignored (no homing in a dry run)" : ""}.\n`);
+    console.log(`\nDry run — nothing written.\n`);
     return;
   }
   if (ready.length === 0) {
@@ -435,31 +348,7 @@ async function main(): Promise<void> {
   console.log("\n=== Offset summary ===");
   console.table(outcomes.map((o) => ({ Joint: o.device.label, Status: o.status })));
 
-  const succeeded = outcomes.filter((o) => o.success);
-  if (!home) {
-    console.log("Next: run with --home to home at the current position, or do it from OBLAC.\n");
-    return;
-  }
-  if (succeeded.length === 0) {
-    console.log("No drive succeeded — not homing.\n");
-    return;
-  }
-
-  banner([
-    `HOMING (method 37) will ENERGIZE ${succeeded.length} drive(s): Operation enabled, Homing mode`,
-    "It defines the current position as home and is not meant to move the shaft",
-    "Keep clear of the robot and keep the approved E-stop/STO within reach",
-  ]);
-  const confirmedHoming = await confirm(`Type "yes" to home ${succeeded.length} drive(s) at their current position, anything else to skip: `);
-  if (!confirmedHoming) {
-    console.log("\nHoming skipped.\n");
-    return;
-  }
-
-  const homing: { Joint: string; Status: string }[] = [];
-  for (const o of succeeded) homing.push({ Joint: o.device.label, Status: await homeAtCurrentPosition(o.device) });
-  console.log("\n=== Homing summary ===");
-  console.table(homing);
+  console.log("Next: home at the current position with home-joints.ts.\n");
 }
 
 client
