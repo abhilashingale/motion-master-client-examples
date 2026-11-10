@@ -21,10 +21,12 @@ The scripts are meant to be run in this order — the full sequence is in
 1. `assign-names.ts` — give every drive its joint label, by position in the EtherCAT chain.
    Skip it if the drives are already labelled.
 2. `load-drive-configs.ts` — load each joint's config file onto its drive.
-3. `write-drive-config.ts` — check and apply polarity, home offset, limits and safety.
+3. `set-encoder-st-offset.ts` — centre the Encoder 2 single-turn range on the home position.
+4. `home-joints.ts` — home each joint at its current position (method 37), one by one.
+5. `write-drive-config.ts` — check and apply polarity, home offset, limits and safety.
 
-Most of this document describes `write-drive-config.ts`, the largest of the three. The new
-first step is described in [assign-names.ts](#assign-namests).
+Most of this document describes `write-drive-config.ts`, the largest of the five. The other
+scripts are described in their own sections further down.
 
 Diagnoses whether the **system polarity** (`0x200D:00`) of the live devices on the currently
 connected Motion Master session matches the values in their corresponding config files under
