@@ -7,7 +7,8 @@ its config file and act on it.
 | Script | What it does |
 |---|---|
 | `assign-names.ts` | **Step 1 of the bring-up.** Writes each drive's joint label (`0x20F2:00`) from the config files, by position in the EtherCAT chain, in a single command. Run it first on a robot whose drives are not labelled yet. |
-| `set-encoder-st-offset.ts` | Centres the Encoder 2 single-turn range on the home position: sets the single turn offset (`0x2112:06`) so the adjusted position (`0x2113:02`) reads 2^19, saves it, verifies, and can then home at the current position (method 37). |
+| `set-encoder-st-offset.ts` | Centres the Encoder 2 single-turn range on the home position: sets the single turn offset (`0x2112:06`) so the adjusted position (`0x2113:02`) reads 2^19, saves it and verifies. |
+| `home-joints.ts` | Homes every joint at its current position (method 37), one after the other, printing each joint's assigned name first. |
 | `write-drive-config.ts` | Diagnoses **system polarity** (`0x200D:00`) against each config file, and can apply polarity, home offset, software position limits and quick stop / SS1 safety configuration in confirmed stages. |
 | `load-drive-configs.ts` | Loads each joint's config file onto its drive, with `--exclude` for objects that must not be overwritten (per-drive calibration values). |
 
@@ -552,11 +553,13 @@ the same network is harmless.
 2. `load-drive-configs.ts --dry-run` — check the pairing table before writing anything.
 3. `load-drive-configs.ts --exclude ...` — load the configs, excluding per-drive calibration
    values (see below).
-4. `set-encoder-st-offset.ts --dry-run`, then `set-encoder-st-offset.ts [--home]` — with every
+4. `set-encoder-st-offset.ts --dry-run`, then `set-encoder-st-offset.ts` — with every
    joint at its home position, centre the Encoder 2 single-turn range (see
    [set-encoder-st-offset.ts](#set-encoder-st-offsetts)).
-5. `write-drive-config.ts --diagnose` — read-only polarity check.
-6. `write-drive-config.ts --apply` — staged, each stage confirmed.
+5. `home-joints.ts --dry-run`, then `home-joints.ts` — home each joint at its current position
+   (method 37), one after the other (see [home-joints.ts](#home-jointsts)).
+6. `write-drive-config.ts --diagnose` — read-only polarity check.
+7. `write-drive-config.ts --apply` — staged, each stage confirmed.
 
 ---
 
@@ -636,9 +639,6 @@ npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts --dry-run
 
 # Set and save (asks for "yes" first); one joint with --device-number 104
 npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts
-
-# Also home at the current position afterwards (separate confirmation)
-npx ts-node src/humanoid_bringup/set-encoder-st-offset.ts --home
 ```
 
 Per drive:
@@ -657,19 +657,52 @@ Per drive:
    (`0x2005:02`) to 1 (YES), saves all parameters (`0x1010`), then reads `0x2113:02` back. The
    drive counts as a success only when it reads 2^19 within `--tolerance` counts (default 4). On
    anything else the previous offset and restore flag are written back and saved.
-4. With `--home`, for the successful drives only and after a second confirmation: Homing at the
-   current position (method 37), then re-checks that the actual position (`0x6064:00`) is within
-   `--home-tolerance-deg` (default 0.5°) of 0.
-
-> **Steps 1-3 only read and write parameters. Step 4 (`--home`) energizes the drives** (Operation
-> enabled, Homing mode). Method 37 only defines the current position as home and is not meant to
-> move the shaft, but run it yourself at the robot with the approved E-stop/STO within reach. Each
-> drive is returned to Switched on disabled and its previous mode of operation is restored.
+This step only reads and writes parameters and never energizes a drive. Homing is the next step,
+[`home-joints.ts`](#home-jointsts).
 
 The calculation assumes the adjusted position is the raw position minus the offset. The script
 warns when a drive does not behave that way, and the read-back after writing catches it. A
-non-zero home offset (`0x607C:00`) shifts the position reported after homing; it is printed.
 `--resolution-bits` (default 20) sets the single-turn resolution if your encoder differs.
+
+---
+
+## home-joints.ts
+
+Homes every joint at its current position with **method 37**, one after the other. Before each
+joint it prints the joint's assigned name and pauses, so whoever is at the robot can see which one
+is being homed:
+
+```
+>>> [3/31] HOMING NOW: 105 head_pitch <<<
+    HOMED (actual position 0.004°, home offset 0x607C:00 = 0)
+```
+
+```
+# List the joints and the order, nothing is written
+npx ts-node src/humanoid_bringup/home-joints.ts --dry-run
+
+# Home every labelled joint (asks for "yes" first)
+npx ts-node src/humanoid_bringup/home-joints.ts
+
+# One joint, or a longer pause (default 2000 ms) between joints
+npx ts-node src/humanoid_bringup/home-joints.ts --device-number 104
+npx ts-node src/humanoid_bringup/home-joints.ts --pause-ms 5000
+```
+
+For each joint, in bus order: Modes of operation (`0x6060:00`) = 6 (Homing), Homing method
+(`0x6098:00`) = 37, controlword `0x06 -> 0x07 -> 0x0F`, then `0x1F` to start homing and wait for
+Homing attained (statusword bit 12). The Actual position (`0x6064:00`) is then reported in degrees
+and should be within `--home-tolerance-deg` (default 0.5°) of 0. Afterwards the drive is returned
+to Switched on disabled and its previous mode of operation is restored, also when homing failed.
+
+It stops at the first joint that fails and leaves the rest alone. Ctrl-C stops after the joint
+being homed. A drive that is already operation enabled or in fault is not touched.
+
+> **This energizes each drive, one at a time** (Operation enabled, Homing mode). Method 37 only
+> defines the current position as home and is not meant to move the joint, but run it yourself at
+> the robot with the approved E-stop/STO within reach, and only once every joint is where it
+> should be when it becomes home. A non-zero home offset (`0x607C:00`) shifts the position
+> reported afterwards; it is printed.
 
 ---
 
