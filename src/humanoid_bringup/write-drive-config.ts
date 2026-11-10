@@ -688,8 +688,12 @@ async function assignNames(): Promise<boolean> {
   }
 
   const results: { "File position (IgH)": number; "New label": string; Status: string }[] = [];
-  for (const row of toWrite) {
-    const result = (Status: string) => results.push({ "File position (IgH)": row.filePosition, "New label": row.newLabel, Status });
+  for (const [i, row] of toWrite.entries()) {
+    console.log(`[${i + 1}/${toWrite.length}] Assigning "${row.newLabel}" to drive #${row.driveNumber} (file position ${row.filePosition})...`);
+    const result = (Status: string) => {
+      console.log(`[${i + 1}/${toWrite.length}] ${row.newLabel}: ${Status}`);
+      results.push({ "File position (IgH)": row.filePosition, "New label": row.newLabel, Status });
+    };
     try {
       await client.request.download(row.deviceRef!, DEVICE_LABEL_INDEX, DEVICE_LABEL_SUBINDEX, row.newLabel, "stringValue", requestTimeout);
       const readBack = String(
@@ -809,13 +813,23 @@ async function loadConfigs(rows: Row[]): Promise<boolean> {
   }
 
   const results: { Device: string; Joint: string; Status: string }[] = [];
-  for (const t of targets) {
+  console.log();
+  for (const [i, t] of targets.entries()) {
+    const progress = `[${i + 1}/${targets.length}]`;
+    const fileName = t.row.filePath!.split("/").pop();
+    console.log(
+      `${progress} Loading config onto ${t.row.label}: ${fileName} ` +
+        `(${t.configFile.parameters.length} parameter(s), ${t.dropped.length} excluded)...`,
+    );
+    const startedAt = Date.now();
     try {
       await lastValueFrom(
         client.request.loadConfig(t.row.liveDevice!.deviceRef, t.configFile.toString(), LOAD_CONFIG_STRATEGY, { count: 10, delay: 500 }),
       );
+      console.log(`${progress} ${t.row.label}: loaded in ${((Date.now() - startedAt) / 1000).toFixed(1)} s`);
       results.push({ Device: t.row.deviceNumber, Joint: t.row.label, Status: `LOADED (${t.configFile.parameters.length} parameter(s), ${t.dropped.length} excluded)` });
     } catch (err: any) {
+      console.error(`${progress} ${t.row.label}: FAILED (${err?.message ?? err})`);
       results.push({ Device: t.row.deviceNumber, Joint: t.row.label, Status: `FAILED (${err?.message ?? err})` });
     }
   }
@@ -881,8 +895,12 @@ async function applyPolarity(rows: Row[]): Promise<void> {
   await checkStoInactiveOnAllDrives(eligible);
 
   const results: { Device: string; Joint: string; Status: string }[] = [];
-  for (const row of eligible) {
+  for (const [i, row] of eligible.entries()) {
     const liveDevice = row.liveDevice!;
+    console.log(
+      `[${i + 1}/${eligible.length}] ${row.label}: ` +
+        (row.status === "MISMATCH" ? `writing polarity ${row.filePolarityValue}, then controlword 0 -> 6 -> 7...` : "controlword 0 -> 6 -> 7..."),
+    );
     try {
       if (row.status === "MISMATCH") {
         const targetValue = row.filePolarityValue!;
@@ -1260,8 +1278,9 @@ async function saveAndReportPositions(homed: Row[]): Promise<void> {
 
   const results: { Device: string; Joint: string; "Position (deg)": string; "Home Offset": number | string; Status: string }[] = [];
   let failure: string | undefined;
-  for (const row of homed) {
+  for (const [i, row] of homed.entries()) {
     const d = row.liveDevice!;
+    console.log(`[${i + 1}/${homed.length}] ${confirmed ? "Saving" : "Reading"} ${row.label}...`);
     let status = confirmed ? "SAVED" : "NOT SAVED";
     try {
       if (confirmed) {
