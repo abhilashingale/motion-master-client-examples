@@ -131,6 +131,10 @@ const SAFETY_STATUSWORD_BYTE1_SUBINDEX = 1;
 const STO_BIT_MASK = 0x01;
 const POSITION_ACTUAL_INDEX = 0x6064;
 const POSITION_ACTUAL_SUBINDEX = 0;
+const POSITION_DEMAND_INDEX = 0x6062;
+const FOLLOWING_ERROR_INDEX = 0x60f4;
+/** Delays after the homing, in ms since the Homing attained bit, at which the position is logged (diagnostics only). */
+const HOMING_SETTLE_LOG_DELAYS_MS = [500, 1000, 2000];
 const HOME_OFFSET_INDEX = 0x607c;
 const HOME_OFFSET_SUBINDEX = 0;
 const RESTORE_HOME_POSITION_INDEX = 0x2005;
@@ -1132,6 +1136,33 @@ function homeOffsetFailure(label: string, homeOffset: number, when: string): str
 }
 
 /**
+ * Diagnostics only: logs one line with the statusword, Actual position (0x6064:00), Position demand
+ * (0x6062:00), Following error (0x60F4:00) and Encoder 2 adjusted position (0x2113:02). An object
+ * the drive does not answer shows as n/a. Never throws and never writes.
+ */
+async function logHomingSnapshot(d: LiveDevice, label: string, tag: string): Promise<void> {
+  const read = async (index: number, subindex: number): Promise<number | undefined> => {
+    try {
+      return await readObject(d, index, subindex);
+    } catch {
+      return undefined;
+    }
+  };
+  const [statusword, actual, demand, following, enc2] = [
+    await read(STATUSWORD_INDEX, 0),
+    await read(POSITION_ACTUAL_INDEX, POSITION_ACTUAL_SUBINDEX),
+    await read(POSITION_DEMAND_INDEX, 0),
+    await read(FOLLOWING_ERROR_INDEX, 0),
+    await read(ENCODER2_FEEDBACK_INDEX, ENCODER2_ADJUSTED_SUBINDEX),
+  ];
+  const counts = (v: number | undefined) => (v === undefined ? "n/a" : `${v} (${countsToDegrees(v).toFixed(3)}°)`);
+  console.log(
+    `    [HOMING LOG] ${label} ${tag.padEnd(22)} statusword=${statusword === undefined ? "n/a" : "0x" + statusword.toString(16)}` +
+      `  actual 0x6064=${counts(actual)}  demand 0x6062=${counts(demand)}  following 0x60F4=${following ?? "n/a"}  enc2 adjusted 0x2113:02=${enc2 ?? "n/a"}`,
+  );
+}
+
+/**
  * Homing method 37 (current position) on one drive: first the Home Offset (0x607C:00) is set to 0,
  * read back and saved (before the drive is energized); then Modes of operation 6, Homing method
  * (0x6098:00) 37, controlword 6 -> 7 -> 15, then 31 to start homing and wait for Homing attained.
@@ -1156,9 +1187,11 @@ async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok
     await writeObject(d, MODES_OF_OPERATION_INDEX, 0, HOMING_MODE);
     await writeObject(d, HOMING_METHOD_INDEX, 0, HOMING_METHOD_CURRENT_POSITION);
 
+    await logHomingSnapshot(d, label, "before enabling");
     for (const controlword of [CW_SHUTDOWN, CW_SWITCH_ON, CW_ENABLE_OPERATION]) {
       await writeObject(d, CONTROLWORD_INDEX, CONTROLWORD_SUBINDEX, controlword);
       await resolveAfter(CONTROLWORD_STEP_DELAY_MS);
+      await logHomingSnapshot(d, label, `after controlword 0x${controlword.toString(16).padStart(2, "0")}`);
     }
     const afterEnable = await readObject(d, STATUSWORD_INDEX, 0);
     if (afterEnable & SW_FAULT || !(afterEnable & SW_OPERATION_ENABLED)) {
@@ -1166,6 +1199,7 @@ async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok
     }
 
     await writeObject(d, CONTROLWORD_INDEX, CONTROLWORD_SUBINDEX, CW_START_HOMING);
+    await logHomingSnapshot(d, label, "after start (0x1f)");
     const deadline = Date.now() + HOMING_TIMEOUT_MS;
     let statusword = 0;
     while (Date.now() < deadline) {
@@ -1176,7 +1210,16 @@ async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok
     if (statusword & (SW_HOMING_ERROR | SW_FAULT)) return { ok: false, status: `HOMING ERROR (statusword 0x${statusword.toString(16)})` };
     if (!(statusword & SW_HOMING_ATTAINED)) return { ok: false, status: `HOMING TIMEOUT (statusword 0x${statusword.toString(16)})` };
 
+    // The threshold check uses this ONE sample of 0x6064, read right after Homing attained.
     const degrees = countsToDegrees(await readObject(d, POSITION_ACTUAL_INDEX, POSITION_ACTUAL_SUBINDEX));
+    await logHomingSnapshot(d, label, "homing attained");
+    // Diagnostics only: keep the drive enabled a little longer and log whether the position settles.
+    let waited = 0;
+    for (const delay of HOMING_SETTLE_LOG_DELAYS_MS) {
+      await resolveAfter(delay - waited);
+      waited = delay;
+      await logHomingSnapshot(d, label, `homing attained +${delay} ms`);
+    }
     const close = Math.abs(degrees) <= homeToleranceDeg;
     return {
       ok: close,
