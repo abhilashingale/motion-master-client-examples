@@ -260,9 +260,7 @@ the maximum range of motion without the single-turn value overflowing.
 **Per joint, one after the other** — its assigned name is printed first, followed by a pause of
 `--pause-ms` (default 2000 ms) so you can see which joint it is:
 
-1. If the Home Offset (`0x607C:00`) is not `0` (e.g. a loaded config carries one), it is reset
-   to `0` and read back. This is reported as a warning.
-2. Writes `0x2112:06` = 0 (and reads it back), applies it by cycling the controlword
+1. Writes `0x2112:06` = 0 (and reads it back), applies it by cycling the controlword
    `6 -> 7 -> 0` (Switched on, then back to Switch on disabled — the power stage is never enabled),
    pauses 5 s, then reads `0x2113:02` (`--samples` samples). The offset is then
 
@@ -275,18 +273,19 @@ the maximum range of motion without the single-turn value overflowing.
    (`0x2005:02`) to `1` (YES), saves all parameters (`0x1010`), applies it with the same `6 -> 7 -> 0` cycle and 5 s pause, then reads `0x2113:02` back. It must be `2^19`
    within `--tolerance` counts (default 4); on anything else the previous offset and restore flag
    are written back and saved, and the run stops.
-3. **Asks for `yes` before homing this joint** (the drive is energized for the homing). Anything
+2. **Asks for `yes` before homing this joint** (the drive is energized for the homing). Anything
    else (`no`) stops the stage at this joint, with its offset already applied but not homed, and
    the later stages do not run.
-4. **Homes at the current position with method 37**: Modes of operation (`0x6060:00`) = 6,
+3. **Homes at the current position with method 37**. First, before the drive is energized, the
+   **Home Offset (`0x607C:00`) is written to `0`, read back and saved** (a failure stops the run
+   with a large warning). Then Modes of operation (`0x6060:00`) = 6,
    Homing method (`0x6098:00`) = 37, controlword `0x06 -> 0x07 -> 0x0F`, then `0x1F` to start
    homing, and waits for Homing attained (statusword bit 12). Method 37 only defines the current
    position as home and is not meant to move the joint, but the drive is energized. Afterwards the
    drive is returned to Switched on disabled and its previous mode of operation is restored, also
    when the homing failed.
-5. **Checks that the Home Offset (`0x607C:00`) is still `0`**. If not, the run **fails loudly**:
-   a large warning naming the joint and the value, and the run stops. It also checks that the
-   Actual position (`0x6064:00`) is within `--home-tolerance-deg` (default 0.5°) of 0.
+4. **Reads the Actual position (`0x6064:00`)** and checks that it is within
+   `--home-tolerance-deg` (default 0.5°) of 0. Nothing else is checked after the homing.
 
 The stage stops at the first joint that fails, prints the summary table, and throws, so Stages 5,
 5 and 7 do not run.
@@ -514,7 +513,7 @@ the same network is harmless.
 | What | Where | Why it matters |
 |---|---|---|
 | **Encoder resolution** | `ASSUMED_ENCODER_RESOLUTION_BITS` in `write-drive-config.ts` (20 bits) | Stages 4-6 convert the Actual position and the software position limits between counts and degrees. A drive with a different resolution gets wrong degrees, so set this to your encoders or make it per-joint. (The Encoder 2 single-turn resolution used in Stage 4 is `--resolution-bits`.) |
-| **Home Offset** | Stage 4 | No correction is added to the Home Offset (`0x607C:00`): it must be `0` after homing, otherwise the run fails loudly. Note that some exported configs carry one (Roger-3: `1048576`, i.e. 360°, in 5 of the files) — Stage 2 does not load `0x607C` (and says so), and Stage 4 still resets a non-zero value to `0` before homing. |
+| **Home Offset** | Stage 4 | No correction is added to the Home Offset (`0x607C:00`): it is set to `0` and saved right before the drive is energized for the homing. Note that some exported configs carry one (Roger-3: `1048576`, i.e. 360°, in 5 of the files) — Stage 2 does not load `0x607C` (and says so). |
 | **Quick stop / SS1 targets** | The Stage 7 constants | These are commissioned values, not defaults. Confirm them against your own safety concept before applying. |
 | **SMM credentials** | `--username` / `--password` (default `Test` / `SomanetSMM`) | Stage 7 needs the real credentials for your drives. |
 

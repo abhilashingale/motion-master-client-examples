@@ -47,9 +47,9 @@
  *     write it with Restore home position (0x2005:02) = 1, save all parameters, read 0x2113:02 back (it must
  *     be 2^19, otherwise the previous values are restored), then home at the current position with
  *     method 37 (Homing method 0x6098:00 = 37, controlword 6 -> 7 -> 15 -> 31). Homing is not
- *     meant to move the joint, but the drive IS energized. NO home offset correction is made: when
- *     the homing is done the Home Offset must still be 0 and the Actual position close to 0,
- *     otherwise the run FAILS LOUDLY and stops. Each drive is returned to Switched on disabled.
+ *     meant to move the joint, but the drive IS energized. Just before the drive is energized the
+ *     Home Offset (0x607C:00) is written to 0, read back and saved; after the homing only the
+ *     Actual position is read and must be close to 0, otherwise the run FAILS LOUDLY and stops. Each drive is returned to Switched on disabled.
  *     Start with the robot mechanically zeroed (or at the zero you want).
  *   Stage 5 (--apply only): ask for confirmation, then SAVE ALL PARAMETERS on every homed device
  *     (0x1010: Store parameters) so the homed position persists, and print the Actual position
@@ -1132,14 +1132,25 @@ function homeOffsetFailure(label: string, homeOffset: number, when: string): str
 }
 
 /**
- * Homing method 37 (current position) on one drive: Modes of operation 6, Homing method
+ * Homing method 37 (current position) on one drive: first the Home Offset (0x607C:00) is set to 0,
+ * read back and saved (before the drive is energized); then Modes of operation 6, Homing method
  * (0x6098:00) 37, controlword 6 -> 7 -> 15, then 31 to start homing and wait for Homing attained.
- * Afterwards the Home Offset (0x607C:00) must still be 0 and the Actual position close to 0.
+ * Afterwards only the Actual position (0x6064:00) is read; it must be close to 0.
  * The drive is always returned to Switched on disabled with its previous mode of operation.
  */
 async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok: boolean; status: string }> {
   let previousMode: number | undefined;
   try {
+    // Step 2: the Home Offset must be 0 BEFORE the drive is energized: write 0, read it back, save.
+    try {
+      await writeAndVerify(d, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX, 0);
+      await lastValueFrom(client.request.saveConfig(d.deviceRef));
+    } catch (err: any) {
+      const message = `HOME OFFSET (0x607C:00) COULD NOT BE SET TO 0 AND SAVED (${err?.message ?? err})`;
+      banner([`${label}: ${message}`, "The joint must be homed with a zero Home Offset - do not use this robot until this is resolved"]);
+      return { ok: false, status: message };
+    }
+
     previousMode = await readObject(d, MODES_OF_OPERATION_INDEX, 0);
 
     await writeObject(d, MODES_OF_OPERATION_INDEX, 0, HOMING_MODE);
@@ -1165,14 +1176,11 @@ async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok
     if (statusword & (SW_HOMING_ERROR | SW_FAULT)) return { ok: false, status: `HOMING ERROR (statusword 0x${statusword.toString(16)})` };
     if (!(statusword & SW_HOMING_ATTAINED)) return { ok: false, status: `HOMING TIMEOUT (statusword 0x${statusword.toString(16)})` };
 
-    const homeOffset = await readObject(d, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX);
-    if (homeOffset !== 0) return { ok: false, status: homeOffsetFailure(label, homeOffset, "AFTER HOMING") };
-
     const degrees = countsToDegrees(await readObject(d, POSITION_ACTUAL_INDEX, POSITION_ACTUAL_SUBINDEX));
     const close = Math.abs(degrees) <= homeToleranceDeg;
     return {
       ok: close,
-      status: `${close ? "HOMED" : "HOMED, POSITION NOT NEAR 0"} (actual position ${degrees.toFixed(3)}°, home offset 0)`,
+      status: `${close ? "HOMED" : "HOMED, POSITION NOT NEAR 0"} (actual position ${degrees.toFixed(3)}°)`,
     };
   } catch (err: any) {
     return { ok: false, status: `HOMING FAILED (${err?.message ?? err})` };
@@ -1193,12 +1201,13 @@ async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok
  *   1. Read --samples (5-10) samples of Encoder 2 feedback Adjusted position (0x2113:02) per
  *      drive (refusing a drive that is moving, operation enabled or in fault) and print the table.
  *   2. After confirmation, per joint: print its assigned name and pause; make sure the Home Offset
- *      (0x607C:00) is 0 (a non-zero value is reset and reported); write the single turn offset
+ *      (0x607C:00) is not touched yet; write the single turn offset
  *      (0x2112:06) = 0, read 0x2113:02, calculate the offset from it (adjusted + 2^19 if below
  *      2^19, else adjusted - 2^19), write it and Restore home position (0x2005:02) = 1, save, and
  *      read 0x2113:02 back — it must be 2^19; then ask the user for "yes" before EVERY joint's
  *      homing (anything else stops the stage); then Homing method 37 at the current position.
- *   3. At the end of the homing the Home Offset must still be 0, otherwise the run fails loudly.
+ *   3. The homing itself starts by writing the Home Offset (0x607C:00) = 0, reading it back and
+ *      saving, before the drive is energized; at its end only the Actual position is checked.
  *
  * Stops at the first joint that fails and throws once the summary is printed, so the later stages
  * never run on a half-commissioned robot. Returns the homed rows, or undefined when aborted.
@@ -1260,17 +1269,6 @@ async function centreEncodersAndHome(eligible: Row[], stage2StatusByDevice: Map<
     await resolveAfter(pauseMs);
 
     try {
-      // The Home Offset must be 0 before homing: reset a leftover value (e.g. from a loaded config).
-      if (p.homeOffsetBefore !== 0) {
-        await writeObject(p.device, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX, 0);
-        const verified = await readObject(p.device, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX);
-        if (verified !== 0) {
-          record(`HOME OFFSET RESET FAILED (read back ${verified})`);
-          failure = homeOffsetFailure(p.row.label, verified, "AFTER A RESET");
-          break;
-        }
-      }
-
       const centred = await applyCentering(p);
       console.log(`    ${centred.status}`);
       if (!centred.ok) {
