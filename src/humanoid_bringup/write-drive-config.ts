@@ -485,6 +485,15 @@ const readObject = (d: LiveDevice, index: number, subindex: number) =>
 const writeObject = (d: LiveDevice, index: number, subindex: number, value: number) =>
   client.request.download(d.deviceRef, index, subindex, value, undefined, requestTimeout);
 
+/** Writes a numeric object and reads it back; throws when the drive does not hold the written value. */
+async function writeAndVerify(d: LiveDevice, index: number, subindex: number, value: number): Promise<void> {
+  await writeObject(d, index, subindex, value);
+  const readBack = await readObject(d, index, subindex);
+  if (readBack !== value) {
+    throw new Error(`0x${index.toString(16).toUpperCase()}:${String(subindex).padStart(2, "0")} wrote ${value} but reads back ${readBack}`);
+  }
+}
+
 /** Prints a block of `!` around the given lines, for warnings that must not be missed. */
 function banner(lines: string[]): void {
   const inner = Math.max(...lines.map((l) => l.length)) + 4;
@@ -1025,8 +1034,8 @@ async function planCentering(row: Row, stage2Status: string | undefined): Promis
 async function rollbackCentering(p: CentrePlan, reason: string): Promise<{ ok: boolean; status: string }> {
   const d = p.device;
   try {
-    await writeObject(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, p.currentOffset);
-    await writeObject(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, p.restoreHomeBefore);
+    await writeAndVerify(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, p.currentOffset);
+    await writeAndVerify(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, p.restoreHomeBefore);
     await lastValueFrom(client.request.saveConfig(d.deviceRef));
     return { ok: false, status: `${reason}, ROLLED BACK` };
   } catch (err: any) {
@@ -1050,7 +1059,7 @@ async function applyCentering(p: CentrePlan): Promise<{ ok: boolean; status: str
   const d = p.device;
   let newOffset: number;
   try {
-    await writeObject(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, 0);
+    await writeAndVerify(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, 0);
     await resolveAfter(ENCODER_SAMPLE_INTERVAL_MS);
     const { adjusted } = await readEncoderSamples(d, encoderSamples);
     if (adjusted.spread > maxSpread) {
@@ -1063,8 +1072,8 @@ async function applyCentering(p: CentrePlan): Promise<{ ok: boolean; status: str
   }
 
   try {
-    await writeObject(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, newOffset);
-    await writeObject(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, 1);
+    await writeAndVerify(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, newOffset);
+    await writeAndVerify(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, 1);
     await lastValueFrom(client.request.saveConfig(d.deviceRef));
   } catch (err: any) {
     return { ok: false, status: `ST OFFSET WRITE/SAVE FAILED (${err?.message ?? err}) — check the drive` };
