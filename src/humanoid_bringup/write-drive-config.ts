@@ -124,6 +124,8 @@ const CONTROLWORD_INDEX = 0x6040;
 const CONTROLWORD_SUBINDEX = 0;
 const CONTROLWORD_TRANSITION = [0, 6, 7];
 const CONTROLWORD_STEP_DELAY_MS = 200;
+/** Pause after the Switch On cycle that applies a changed encoder configuration, before reading it back. */
+const APPLY_PAUSE_MS = 5000;
 const SAFETY_STATUSWORD_INDEX = 0x6621;
 const SAFETY_STATUSWORD_BYTE1_SUBINDEX = 1;
 const STO_BIT_MASK = 0x01;
@@ -148,6 +150,7 @@ const HOMING_METHOD_CURRENT_POSITION = 37;
 const HOMING_TIMEOUT_MS = 10000;
 const SW_FAULT = 1 << 3;
 const SW_OPERATION_ENABLED = 1 << 2;
+const SW_SWITCHED_ON = 1 << 1;
 const SW_HOMING_ATTAINED = 1 << 12;
 const SW_HOMING_ERROR = 1 << 13;
 const CW_SHUTDOWN = 0x06;
@@ -492,6 +495,31 @@ async function writeAndVerify(d: LiveDevice, index: number, subindex: number, va
   if (readBack !== value) {
     throw new Error(`0x${index.toString(16).toUpperCase()}:${String(subindex).padStart(2, "0")} wrote ${value} but reads back ${readBack}`);
   }
+}
+
+/**
+ * Applies a changed encoder configuration: controlword Shutdown (6) -> Switch on (7), then always
+ * back to Switch on disabled (0), and a pause of APPLY_PAUSE_MS before the caller reads anything
+ * back. The power stage is never enabled (Operation enabled is not reached). Throws when the
+ * drive does not leave Switch on disabled (e.g. STO active) or is in fault.
+ */
+async function cycleSwitchOnAndDisable(d: LiveDevice): Promise<void> {
+  try {
+    for (const controlword of [CW_SHUTDOWN, CW_SWITCH_ON]) {
+      await writeObject(d, CONTROLWORD_INDEX, CONTROLWORD_SUBINDEX, controlword);
+      await resolveAfter(CONTROLWORD_STEP_DELAY_MS);
+    }
+    const statusword = await readObject(d, STATUSWORD_INDEX, 0);
+    if (statusword & SW_FAULT) throw new Error(`drive in fault after the Switch On cycle (statusword 0x${statusword.toString(16)})`);
+    if (!(statusword & SW_SWITCHED_ON)) throw new Error(`drive did not reach Switched on (statusword 0x${statusword.toString(16)}) — is STO active?`);
+  } finally {
+    try {
+      await writeObject(d, CONTROLWORD_INDEX, CONTROLWORD_SUBINDEX, CW_DISABLE_VOLTAGE);
+    } catch {
+      console.error("  [ERROR] could not return the drive to Switched on disabled — check the drive.");
+    }
+  }
+  await resolveAfter(APPLY_PAUSE_MS);
 }
 
 /** Prints a block of `!` around the given lines, for warnings that must not be missed. */
@@ -1037,6 +1065,7 @@ async function rollbackCentering(p: CentrePlan, reason: string): Promise<{ ok: b
     await writeAndVerify(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, p.currentOffset);
     await writeAndVerify(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, p.restoreHomeBefore);
     await lastValueFrom(client.request.saveConfig(d.deviceRef));
+    await cycleSwitchOnAndDisable(d);
     return { ok: false, status: `${reason}, ROLLED BACK` };
   } catch (err: any) {
     return {
@@ -1048,10 +1077,11 @@ async function rollbackCentering(p: CentrePlan, reason: string): Promise<{ ok: b
 
 /**
  * Centres the Encoder 2 single turn range, using only the adjusted position (0x2113:02):
- *   1. Write the single turn offset (0x2112:06) = 0 and read 0x2113:02 (--samples samples).
+ *   1. Write the single turn offset (0x2112:06) = 0 (read back), apply it with a Switch On cycle
+ *      (controlword 6 -> 7 -> 0) and a 5 s pause, then read 0x2113:02 (--samples samples).
  *   2. offset = adjusted + 2^19 if adjusted < 2^19, else adjusted - 2^19.
- *   3. Write the offset and Restore home position (0x2005:02) = 1, save, read 0x2113:02 back: it
- *      must be 2^19 within --tolerance counts.
+ *   3. Write the offset and Restore home position (0x2005:02) = 1 (read back), save, apply with the
+ *      same Switch On cycle and 5 s pause, read 0x2113:02 back: it must be 2^19 within --tolerance.
  * On any failure after the first write the previous offset and restore flag are written back
  * and saved.
  */
@@ -1060,7 +1090,8 @@ async function applyCentering(p: CentrePlan): Promise<{ ok: boolean; status: str
   let newOffset: number;
   try {
     await writeAndVerify(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, 0);
-    await resolveAfter(ENCODER_SAMPLE_INTERVAL_MS);
+    console.log(`    offset set to 0, applying via Switch On -> Switch on disabled, then waiting ${APPLY_PAUSE_MS / 1000} s...`);
+    await cycleSwitchOnAndDisable(d);
     const { adjusted } = await readEncoderSamples(d, encoderSamples);
     if (adjusted.spread > maxSpread) {
       return await rollbackCentering(p, `JOINT MOVING (adjusted spread ${adjusted.spread} > ${maxSpread} with the offset at 0)`);
@@ -1075,8 +1106,10 @@ async function applyCentering(p: CentrePlan): Promise<{ ok: boolean; status: str
     await writeAndVerify(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, newOffset);
     await writeAndVerify(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, 1);
     await lastValueFrom(client.request.saveConfig(d.deviceRef));
+    console.log(`    offset ${newOffset} saved, applying via Switch On -> Switch on disabled, then waiting ${APPLY_PAUSE_MS / 1000} s...`);
+    await cycleSwitchOnAndDisable(d);
   } catch (err: any) {
-    return { ok: false, status: `ST OFFSET WRITE/SAVE FAILED (${err?.message ?? err}) — check the drive` };
+    return { ok: false, status: `ST OFFSET WRITE/SAVE/APPLY FAILED (${err?.message ?? err}) — check the drive` };
   }
 
   try {

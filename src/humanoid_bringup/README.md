@@ -262,7 +262,9 @@ the maximum range of motion without the single-turn value overflowing.
 
 1. If the Home Offset (`0x607C:00`) is not `0` (e.g. a loaded config carries one), it is reset
    to `0` and read back. This is reported as a warning.
-2. Writes `0x2112:06` = 0 and reads `0x2113:02` (`--samples` samples). The offset is then
+2. Writes `0x2112:06` = 0 (and reads it back), applies it by cycling the controlword
+   `6 -> 7 -> 0` (Switched on, then back to Switch on disabled — the power stage is never enabled),
+   pauses 5 s, then reads `0x2113:02` (`--samples` samples). The offset is then
 
    ```
    IF adjusted < 2^19    offset = adjusted + 2^19
@@ -270,7 +272,7 @@ the maximum range of motion without the single-turn value overflowing.
    ```
 
    It writes that offset to `0x2112:06`, sets *Restore home position when loading configuration*
-   (`0x2005:02`) to `1` (YES), saves all parameters (`0x1010`), then reads `0x2113:02` back. It must be `2^19`
+   (`0x2005:02`) to `1` (YES), saves all parameters (`0x1010`), applies it with the same `6 -> 7 -> 0` cycle and 5 s pause, then reads `0x2113:02` back. It must be `2^19`
    within `--tolerance` counts (default 4); on anything else the previous offset and restore flag
    are written back and saved, and the run stops.
 3. **Homes at the current position with method 37**: Modes of operation (`0x6060:00`) = 6,
