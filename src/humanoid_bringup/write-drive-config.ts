@@ -1196,7 +1196,8 @@ async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok
  *      (0x607C:00) is 0 (a non-zero value is reset and reported); write the single turn offset
  *      (0x2112:06) = 0, read 0x2113:02, calculate the offset from it (adjusted + 2^19 if below
  *      2^19, else adjusted - 2^19), write it and Restore home position (0x2005:02) = 1, save, and
- *      read 0x2113:02 back — it must be 2^19; then Homing method 37 at the current position.
+ *      read 0x2113:02 back — it must be 2^19; then ask the user for "yes" before EVERY joint's
+ *      homing (anything else stops the stage); then Homing method 37 at the current position.
  *   3. At the end of the homing the Home Offset must still be 0, otherwise the run fails loudly.
  *
  * Stops at the first joint that fails and throws once the summary is printed, so the later stages
@@ -1275,6 +1276,18 @@ async function centreEncodersAndHome(eligible: Row[], stage2StatusByDevice: Map<
       if (!centred.ok) {
         record(centred.status);
         failure = `${p.row.label}: ${centred.status}`;
+        break;
+      }
+
+      // Homing energizes this drive (Operation enabled): ask for every single joint.
+      const acknowledged = await confirm(
+        `    ${p.row.label}: offset applied. Type "yes" to HOME this joint now (the drive will be energized), "no" or anything else to stop here: `,
+      );
+      if (!acknowledged) {
+        const stopped = "HOMING NOT ACKNOWLEDGED (stopped by the user before homing)";
+        console.log(`    ${stopped}`);
+        record(`${centred.status}; ${stopped}`);
+        failure = `${p.row.label}: ${stopped}`;
         break;
       }
 

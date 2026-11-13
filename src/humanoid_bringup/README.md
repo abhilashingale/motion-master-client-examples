@@ -275,13 +275,16 @@ the maximum range of motion without the single-turn value overflowing.
    (`0x2005:02`) to `1` (YES), saves all parameters (`0x1010`), applies it with the same `6 -> 7 -> 0` cycle and 5 s pause, then reads `0x2113:02` back. It must be `2^19`
    within `--tolerance` counts (default 4); on anything else the previous offset and restore flag
    are written back and saved, and the run stops.
-3. **Homes at the current position with method 37**: Modes of operation (`0x6060:00`) = 6,
+3. **Asks for `yes` before homing this joint** (the drive is energized for the homing). Anything
+   else (`no`) stops the stage at this joint, with its offset already applied but not homed, and
+   the later stages do not run.
+4. **Homes at the current position with method 37**: Modes of operation (`0x6060:00`) = 6,
    Homing method (`0x6098:00`) = 37, controlword `0x06 -> 0x07 -> 0x0F`, then `0x1F` to start
    homing, and waits for Homing attained (statusword bit 12). Method 37 only defines the current
    position as home and is not meant to move the joint, but the drive is energized. Afterwards the
    drive is returned to Switched on disabled and its previous mode of operation is restored, also
    when the homing failed.
-4. **Checks that the Home Offset (`0x607C:00`) is still `0`**. If not, the run **fails loudly**:
+5. **Checks that the Home Offset (`0x607C:00`) is still `0`**. If not, the run **fails loudly**:
    a large warning naming the joint and the value, and the run stops. It also checks that the
    Actual position (`0x6064:00`) is within `--home-tolerance-deg` (default 0.5°) of 0.
 
