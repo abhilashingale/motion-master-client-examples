@@ -284,7 +284,7 @@ the maximum range of motion without the single-turn value overflowing.
    position as home and is not meant to move the joint, but the drive is energized. Afterwards the
    drive is returned to Switched on disabled and its previous mode of operation is restored, also
    when the homing failed.
-4. **Reads the Actual position (`0x6064:00`)** and checks that it is within
+4. **Reads the Actual position (`0x6064:00`) 5 times** (100 ms apart) and checks that the mean is within
    `--home-tolerance-deg` (default 0.5°) of 0. Nothing else is checked after the homing.
 
 The stage stops at the first joint that fails, prints the summary table, and throws, so Stages 5,

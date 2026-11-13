@@ -135,6 +135,8 @@ const POSITION_DEMAND_INDEX = 0x6062;
 const FOLLOWING_ERROR_INDEX = 0x60f4;
 /** Delays after the homing, in ms since the Homing attained bit, at which the position is logged (diagnostics only). */
 const HOMING_SETTLE_LOG_DELAYS_MS = [500, 1000, 2000];
+/** Samples of the Actual position (0x6064:00) averaged for the threshold check after homing (at least 5). */
+const HOMING_POSITION_SAMPLES = 5;
 const HOME_OFFSET_INDEX = 0x607c;
 const HOME_OFFSET_SUBINDEX = 0;
 const RESTORE_HOME_POSITION_INDEX = 0x2005;
@@ -1210,20 +1212,29 @@ async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok
     if (statusword & (SW_HOMING_ERROR | SW_FAULT)) return { ok: false, status: `HOMING ERROR (statusword 0x${statusword.toString(16)})` };
     if (!(statusword & SW_HOMING_ATTAINED)) return { ok: false, status: `HOMING TIMEOUT (statusword 0x${statusword.toString(16)})` };
 
-    // The threshold check uses this ONE sample of 0x6064, read right after Homing attained.
-    const degrees = countsToDegrees(await readObject(d, POSITION_ACTUAL_INDEX, POSITION_ACTUAL_SUBINDEX));
+    // The threshold check uses the MEAN of HOMING_POSITION_SAMPLES reads of 0x6064, taken right after Homing attained.
+    const attainedAt = Date.now();
     await logHomingSnapshot(d, label, "homing attained");
+    const samples: number[] = [];
+    for (let i = 0; i < HOMING_POSITION_SAMPLES; i++) {
+      samples.push(await readObject(d, POSITION_ACTUAL_INDEX, POSITION_ACTUAL_SUBINDEX));
+      if (i < HOMING_POSITION_SAMPLES - 1) await resolveAfter(ENCODER_SAMPLE_INTERVAL_MS);
+    }
+    const meanCounts = samples.reduce((sum, v) => sum + v, 0) / samples.length;
+    const degrees = countsToDegrees(meanCounts);
+    console.log(
+      `    [HOMING LOG] ${label} actual position samples (${samples.length}): ${samples.join(", ")} -> mean ${meanCounts.toFixed(1)} ` +
+        `(${degrees.toFixed(3)}°), min-max spread ${Math.max(...samples) - Math.min(...samples)} counts`,
+    );
     // Diagnostics only: keep the drive enabled a little longer and log whether the position settles.
-    let waited = 0;
     for (const delay of HOMING_SETTLE_LOG_DELAYS_MS) {
-      await resolveAfter(delay - waited);
-      waited = delay;
+      await resolveAfter(Math.max(0, attainedAt + delay - Date.now()));
       await logHomingSnapshot(d, label, `homing attained +${delay} ms`);
     }
     const close = Math.abs(degrees) <= homeToleranceDeg;
     return {
       ok: close,
-      status: `${close ? "HOMED" : "HOMED, POSITION NOT NEAR 0"} (actual position ${degrees.toFixed(3)}°)`,
+      status: `${close ? "HOMED" : "HOMED, POSITION NOT NEAR 0"} (actual position ${degrees.toFixed(3)}°, mean of ${samples.length} samples)`,
     };
   } catch (err: any) {
     return { ok: false, status: `HOMING FAILED (${err?.message ?? err})` };
