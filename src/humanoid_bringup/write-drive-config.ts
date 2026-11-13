@@ -39,12 +39,12 @@
  *     the config file (MISMATCH devices only) and cycles the controlword 0 -> 6 -> 7 on every
  *     MATCH/MISMATCH device. The polarity is saved in Stage 4.
  *   Stage 4 (--apply only): for every joint that completed Stage 3, centre the Encoder 2 single
- *     turn range and home the joint there. Read --samples (5-10) samples of Encoder 2 feedback Raw
- *     (0x2113:01) and Adjusted (0x2113:02) position per drive, calculate the single turn offset
- *     (IF raw < resolution/2 THEN raw + 2^19 ELSE raw - 2^19) and print a table with the adjusted
- *     position expected afterwards (2^19). After confirmation, joint by joint (its assigned name
- *     is printed, followed by a pause): make sure the Home Offset (0x607C:00) is 0, write 0x2112:06
- *     and Restore home position (0x2005:02) = 1, save all parameters, read 0x2113:02 back (it must
+ *     turn range and home the joint there. Read --samples (5-10) samples of Encoder 2 feedback
+ *     Adjusted position (0x2113:02) per drive (refusing a moving drive) and print a table. After
+ *     confirmation, joint by joint (its assigned name is printed, followed by a pause): make sure
+ *     the Home Offset (0x607C:00) is 0, set 0x2112:06 = 0, read 0x2113:02, calculate the offset
+ *     (IF adjusted < 2^19 THEN adjusted + 2^19 ELSE adjusted - 2^19; 0x2113:01 is never used),
+ *     write it with Restore home position (0x2005:02) = 1, save all parameters, read 0x2113:02 back (it must
  *     be 2^19, otherwise the previous values are restored), then home at the current position with
  *     method 37 (Homing method 0x6098:00 = 37, controlword 6 -> 7 -> 15 -> 31). Homing is not
  *     meant to move the joint, but the drive IS energized. NO home offset correction is made: when
@@ -141,7 +141,6 @@ const HOMING_METHOD_INDEX = 0x6098;
 const ENCODER2_ST_OFFSET_INDEX = 0x2112;
 const ENCODER2_ST_OFFSET_SUBINDEX = 6;
 const ENCODER2_FEEDBACK_INDEX = 0x2113;
-const ENCODER2_RAW_SUBINDEX = 1;
 const ENCODER2_ADJUSTED_SUBINDEX = 2;
 const ENCODER_SAMPLE_INTERVAL_MS = 100;
 const HOMING_MODE = 6;
@@ -959,9 +958,12 @@ function circularDiff(a: number, b: number): number {
   return d > ENCODER2_HALF ? d - ENCODER2_RESOLUTION : d;
 }
 
-/** The single turn offset that puts the raw position in the middle of the range. */
-function calculateSingleTurnOffset(raw: number): number {
-  return raw < ENCODER2_HALF ? raw + ENCODER2_HALF : raw - ENCODER2_HALF;
+/**
+ * The single turn offset that puts the position in the middle of the range, from the Encoder 2
+ * adjusted position (0x2113:02) read while the offset (0x2112:06) is 0.
+ */
+function calculateSingleTurnOffset(adjustedAtZeroOffset: number): number {
+  return adjustedAtZeroOffset < ENCODER2_HALF ? adjustedAtZeroOffset + ENCODER2_HALF : adjustedAtZeroOffset - ENCODER2_HALF;
 }
 
 /**
@@ -977,31 +979,27 @@ function circularMean(values: number[]): { mean: number; spread: number } {
 }
 
 async function readEncoderSamples(d: LiveDevice, count: number) {
-  const raw: number[] = [];
   const adjusted: number[] = [];
   for (let i = 0; i < count; i++) {
-    raw.push(await readObject(d, ENCODER2_FEEDBACK_INDEX, ENCODER2_RAW_SUBINDEX));
     adjusted.push(await readObject(d, ENCODER2_FEEDBACK_INDEX, ENCODER2_ADJUSTED_SUBINDEX));
     if (i < count - 1) await resolveAfter(ENCODER_SAMPLE_INTERVAL_MS);
   }
-  return { raw: circularMean(raw), adjusted: circularMean(adjusted) };
+  return { adjusted: circularMean(adjusted) };
 }
 
 interface CentrePlan {
   row: Row;
   device: LiveDevice;
-  raw: number;
   adjustedBefore: number;
   currentOffset: number;
   restoreHomeBefore: number;
   homeOffsetBefore: number;
-  newOffset: number;
   skip?: string;
 }
 
 async function planCentering(row: Row, stage2Status: string | undefined): Promise<CentrePlan> {
   const device = row.liveDevice!;
-  const blank = { row, device, raw: NaN, adjustedBefore: NaN, currentOffset: NaN, restoreHomeBefore: NaN, homeOffsetBefore: NaN, newOffset: NaN };
+  const blank = { row, device, adjustedBefore: NaN, currentOffset: NaN, restoreHomeBefore: NaN, homeOffsetBefore: NaN };
   if (stage2Status !== "APPLIED" && stage2Status !== "TRANSITIONED") {
     return { ...blank, skip: `STAGE 2 DID NOT COMPLETE (${stage2Status ?? "no result"})` };
   }
@@ -1013,34 +1011,59 @@ async function planCentering(row: Row, stage2Status: string | undefined): Promis
     const currentOffset = await readObject(device, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX);
     const restoreHomeBefore = await readObject(device, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX);
     const homeOffsetBefore = await readObject(device, HOME_OFFSET_INDEX, HOME_OFFSET_SUBINDEX);
-    const { raw, adjusted } = await readEncoderSamples(device, encoderSamples);
-    if (raw.spread > maxSpread) {
-      return { ...blank, currentOffset, restoreHomeBefore, homeOffsetBefore, skip: `JOINT MOVING (raw spread ${raw.spread} > ${maxSpread})` };
+    const { adjusted } = await readEncoderSamples(device, encoderSamples);
+    if (adjusted.spread > maxSpread) {
+      return { ...blank, currentOffset, restoreHomeBefore, homeOffsetBefore, skip: `JOINT MOVING (adjusted spread ${adjusted.spread} > ${maxSpread})` };
     }
-    return {
-      row,
-      device,
-      raw: raw.mean,
-      adjustedBefore: adjusted.mean,
-      currentOffset,
-      restoreHomeBefore,
-      homeOffsetBefore,
-      newOffset: calculateSingleTurnOffset(raw.mean),
-    };
+    return { row, device, adjustedBefore: adjusted.mean, currentOffset, restoreHomeBefore, homeOffsetBefore };
   } catch (err: any) {
     return { ...blank, skip: `READ FAILED (${err?.message ?? err})` };
   }
 }
 
+/** Writes the previous Encoder 2 single turn offset and Restore home position back and saves. */
+async function rollbackCentering(p: CentrePlan, reason: string): Promise<{ ok: boolean; status: string }> {
+  const d = p.device;
+  try {
+    await writeObject(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, p.currentOffset);
+    await writeObject(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, p.restoreHomeBefore);
+    await lastValueFrom(client.request.saveConfig(d.deviceRef));
+    return { ok: false, status: `${reason}, ROLLED BACK` };
+  } catch (err: any) {
+    return {
+      ok: false,
+      status: `${reason}, ROLLBACK FAILED (${err?.message ?? err}) — restore 0x2112:06=${p.currentOffset}, 0x2005:02=${p.restoreHomeBefore} manually`,
+    };
+  }
+}
+
 /**
- * Writes the Encoder 2 single turn offset and Restore home position = 1, saves, and reads the
- * adjusted position back; it must be the middle of the range within --tolerance counts. On any
- * other result the previous offset and restore flag are written back and saved.
+ * Centres the Encoder 2 single turn range, using only the adjusted position (0x2113:02):
+ *   1. Write the single turn offset (0x2112:06) = 0 and read 0x2113:02 (--samples samples).
+ *   2. offset = adjusted + 2^19 if adjusted < 2^19, else adjusted - 2^19.
+ *   3. Write the offset and Restore home position (0x2005:02) = 1, save, read 0x2113:02 back: it
+ *      must be 2^19 within --tolerance counts.
+ * On any failure after the first write the previous offset and restore flag are written back
+ * and saved.
  */
 async function applyCentering(p: CentrePlan): Promise<{ ok: boolean; status: string }> {
   const d = p.device;
+  let newOffset: number;
   try {
-    await writeObject(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, p.newOffset);
+    await writeObject(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, 0);
+    await resolveAfter(ENCODER_SAMPLE_INTERVAL_MS);
+    const { adjusted } = await readEncoderSamples(d, encoderSamples);
+    if (adjusted.spread > maxSpread) {
+      return await rollbackCentering(p, `JOINT MOVING (adjusted spread ${adjusted.spread} > ${maxSpread} with the offset at 0)`);
+    }
+    newOffset = calculateSingleTurnOffset(adjusted.mean);
+    console.log(`    adjusted position with offset 0: ${adjusted.mean} -> single turn offset ${newOffset}`);
+  } catch (err: any) {
+    return await rollbackCentering(p, `ST OFFSET ZERO/READ FAILED (${err?.message ?? err})`);
+  }
+
+  try {
+    await writeObject(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, newOffset);
     await writeObject(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, 1);
     await lastValueFrom(client.request.saveConfig(d.deviceRef));
   } catch (err: any) {
@@ -1051,19 +1074,9 @@ async function applyCentering(p: CentrePlan): Promise<{ ok: boolean; status: str
     const { adjusted } = await readEncoderSamples(d, 5);
     const error = circularDiff(adjusted.mean, ENCODER2_HALF);
     if (Math.abs(error) <= centreTolerance && adjusted.spread <= maxSpread) {
-      return { ok: true, status: `ST OFFSET SET (adjusted position ${adjusted.mean}, ${error >= 0 ? "+" : ""}${error} from the middle)` };
+      return { ok: true, status: `ST OFFSET SET to ${newOffset} (adjusted position ${adjusted.mean}, ${error >= 0 ? "+" : ""}${error} from the middle)` };
     }
-    try {
-      await writeObject(d, ENCODER2_ST_OFFSET_INDEX, ENCODER2_ST_OFFSET_SUBINDEX, p.currentOffset);
-      await writeObject(d, RESTORE_HOME_POSITION_INDEX, RESTORE_HOME_POSITION_SUBINDEX, p.restoreHomeBefore);
-      await lastValueFrom(client.request.saveConfig(d.deviceRef));
-      return { ok: false, status: `ST OFFSET FAILED, ROLLED BACK (adjusted position ${adjusted.mean}, ${error} from the middle)` };
-    } catch (err: any) {
-      return {
-        ok: false,
-        status: `ST OFFSET FAILED AND ROLLBACK FAILED (${err?.message ?? err}) — restore 0x2112:06=${p.currentOffset}, 0x2005:02=${p.restoreHomeBefore} manually`,
-      };
-    }
+    return await rollbackCentering(p, `ST OFFSET FAILED (adjusted position ${adjusted.mean}, ${error} from the middle)`);
   } catch (err: any) {
     return { ok: false, status: `ST OFFSET VERIFY FAILED (${err?.message ?? err})` };
   }
@@ -1135,14 +1148,13 @@ async function homeAtCurrentPosition(d: LiveDevice, label: string): Promise<{ ok
  * Stage 4: for every joint that completed Stage 3, centres the Encoder 2 single turn range and
  * homes the joint there, one joint after the other:
  *
- *   1. Read --samples (5-10) samples of Encoder 2 feedback Raw (0x2113:01) and Adjusted
- *      (0x2113:02) position per drive (refusing a drive that is moving or operation enabled),
- *      calculate the single turn offset (IF raw < resolution/2 THEN raw + 2^19 ELSE raw - 2^19)
- *      and print the table, including the adjusted position expected afterwards (2^19).
+ *   1. Read --samples (5-10) samples of Encoder 2 feedback Adjusted position (0x2113:02) per
+ *      drive (refusing a drive that is moving, operation enabled or in fault) and print the table.
  *   2. After confirmation, per joint: print its assigned name and pause; make sure the Home Offset
  *      (0x607C:00) is 0 (a non-zero value is reset and reported); write the single turn offset
- *      (0x2112:06) and Restore home position (0x2005:02) = 1, save, and read 0x2113:02 back — it
- *      must be 2^19; then Homing method 37 at the current position.
+ *      (0x2112:06) = 0, read 0x2113:02, calculate the offset from it (adjusted + 2^19 if below
+ *      2^19, else adjusted - 2^19), write it and Restore home position (0x2005:02) = 1, save, and
+ *      read 0x2113:02 back — it must be 2^19; then Homing method 37 at the current position.
  *   3. At the end of the homing the Home Offset must still be 0, otherwise the run fails loudly.
  *
  * Stops at the first joint that fails and throws once the summary is printed, so the later stages
@@ -1164,23 +1176,13 @@ async function centreEncodersAndHome(eligible: Row[], stage2StatusByDevice: Map<
       Device: p.row.deviceNumber,
       Joint: p.row.label,
       "Adjusted before (0x2113:02)": show(p.adjustedBefore),
-      "Raw (0x2113:01)": show(p.raw),
       "ST offset now (0x2112:06)": show(p.currentOffset),
-      "Calculated ST offset": show(p.newOffset),
-      "Expected adjusted after": Number.isNaN(p.newOffset) ? "-" : wrapEncoder(p.raw - p.newOffset),
       "Home offset now (0x607C:00)": show(p.homeOffsetBefore),
       Status: p.skip ?? "READY",
     })),
   );
   for (const p of plans) {
     if (p.skip) continue;
-    const expected = wrapEncoder(p.raw - p.currentOffset);
-    if (Math.abs(circularDiff(expected, p.adjustedBefore)) > Math.max(centreTolerance, maxSpread)) {
-      console.warn(
-        `[WARN] ${p.row.label}: adjusted position ${p.adjustedBefore} is not raw - offset (${expected}). ` +
-          `The result is verified after writing and rolled back if it is not ${ENCODER2_HALF}.`,
-      );
-    }
     if (p.homeOffsetBefore !== 0) {
       console.warn(`[WARN] ${p.row.label}: Home Offset (0x607C:00) is ${p.homeOffsetBefore}, not 0 — it will be reset to 0 before homing.`);
     }

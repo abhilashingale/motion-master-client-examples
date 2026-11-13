@@ -110,7 +110,7 @@ MOTION_MASTER_HOSTNAME=<host> npx ts-node src/humanoid_bringup/write-drive-confi
 | `--ignore_ecat_indices <list>` | *(none)* | Stage 1: comma-separated IgH positions of slaves that are not drives (e.g. Beckhoff EtherCAT switches), which have no config file, e.g. `0,3,18`. |
 | `--samples <n>` | `10` | Stage 4: samples of the Encoder 2 position per drive (5-10). |
 | `--resolution-bits <n>` | `20` | Stage 4: Encoder 2 single-turn resolution in bits; the middle is `2^(n-1)`. |
-| `--max-spread <counts>` | `16` | Stage 4: a drive whose raw Encoder 2 position varies by more than this is refused as moving. |
+| `--max-spread <counts>` | `16` | Stage 4: a drive whose Encoder 2 adjusted position varies by more than this is refused as moving. |
 | `--tolerance <counts>` | `4` | Stage 4: how far from the middle the read-back adjusted position may be. |
 | `--home-tolerance-deg <deg>` | `0.5` | Stage 4: largest `|Actual position|` after homing that counts as close to 0. |
 | `--pause-ms <ms>` | `2000` | Stage 4: pause after printing each joint's name, before it is processed. |
@@ -249,29 +249,28 @@ the maximum range of motion without the single-turn value overflowing.
 
 **Planning (read-only), for every joint that completed Stage 3:**
 
-1. Reads `--samples` (5-10, default 10) samples of the raw (`0x2113:01`) and adjusted
-   (`0x2113:02`) position. A drive whose raw value varies by more than `--max-spread` counts
-   (default 16) is refused as moving, and so is one that is operation enabled or in fault.
-2. Calculates the offset from the raw position:
-
-   ```
-   IF raw < resolution / 2    offset = raw + 2^19
-   ELSE                       offset = raw - 2^19
-   ```
-
-3. Prints a table: adjusted position before, raw position, offset now, calculated offset, the
-   adjusted position expected afterwards (`2^19`), the Home Offset now, and a status.
+1. Reads `--samples` (5-10, default 10) samples of the adjusted position (`0x2113:02`). A drive
+   whose value varies by more than `--max-spread` counts (default 16) is refused as moving, and
+   so is one that is operation enabled or in fault. The raw position (`0x2113:01`) is never used.
+2. Prints a table: adjusted position before, offset now, the Home Offset now, and a status.
    A joint that cannot be processed stops the stage before anything is written — homing only
    some of the joints would leave the robot half-commissioned.
-4. Prints a large warning, because the drives are energized, and asks for `yes`.
+3. Prints a large warning, because the drives are energized, and asks for `yes`.
 
 **Per joint, one after the other** — its assigned name is printed first, followed by a pause of
 `--pause-ms` (default 2000 ms) so you can see which joint it is:
 
 1. If the Home Offset (`0x607C:00`) is not `0` (e.g. a loaded config carries one), it is reset
    to `0` and read back. This is reported as a warning.
-2. Writes `0x2112:06` and sets *Restore home position when loading configuration* (`0x2005:02`)
-   to `1` (YES), saves all parameters (`0x1010`), then reads `0x2113:02` back. It must be `2^19`
+2. Writes `0x2112:06` = 0 and reads `0x2113:02` (`--samples` samples). The offset is then
+
+   ```
+   IF adjusted < 2^19    offset = adjusted + 2^19
+   ELSE                  offset = adjusted - 2^19
+   ```
+
+   It writes that offset to `0x2112:06`, sets *Restore home position when loading configuration*
+   (`0x2005:02`) to `1` (YES), saves all parameters (`0x1010`), then reads `0x2113:02` back. It must be `2^19`
    within `--tolerance` counts (default 4); on anything else the previous offset and restore flag
    are written back and saved, and the run stops.
 3. **Homes at the current position with method 37**: Modes of operation (`0x6060:00`) = 6,
@@ -287,9 +286,8 @@ the maximum range of motion without the single-turn value overflowing.
 The stage stops at the first joint that fails, prints the summary table, and throws, so Stages 5,
 5 and 7 do not run.
 
-The calculation assumes the adjusted position is the raw position minus the offset. The script
-warns when a drive does not behave that way, and the read-back after writing catches it.
-`--resolution-bits` (default 20) sets the single-turn resolution if your encoder differs.
+The calculation assumes the adjusted position is the position at offset 0 minus the offset;
+the read-back after writing catches a drive that behaves differently. `--resolution-bits` (default 20) sets the single-turn resolution if your encoder differs.
 
 ### Stage 5 — save and report actual position
 
