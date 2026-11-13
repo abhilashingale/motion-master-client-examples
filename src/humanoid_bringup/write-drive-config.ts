@@ -922,6 +922,13 @@ async function applyPolarity(rows: Row[]): Promise<void> {
       } catch (err: any) {
         const prefix = row.status === "MISMATCH" ? "POLARITY WRITTEN, " : "";
         results.push({ Device: row.deviceNumber, Joint: row.label, Status: `${prefix}CONTROLWORD TRANSITION FAILED (${err?.message ?? err})` });
+      } finally {
+        // The transition ends in Switched on: leave the drive in Switch on disabled again.
+        try {
+          await client.request.download(liveDevice.deviceRef, CONTROLWORD_INDEX, CONTROLWORD_SUBINDEX, CW_DISABLE_VOLTAGE, undefined, requestTimeout);
+        } catch {
+          console.error(`  [ERROR] could not return ${row.label} to Switched on disabled — check the drive.`);
+        }
       }
     } catch (err: any) {
       results.push({ Device: row.deviceNumber, Joint: row.label, Status: `WRITE FAILED (${err?.message ?? err})` });
